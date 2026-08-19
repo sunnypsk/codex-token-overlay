@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-08-19T09:12:29.322Z",
+  "ccusageCommit": "914b4f4a562040fa0c4bf8d4dc7f3ae27d70e73c",
+  "license": "MIT",
+  "sources": [
+    {
+      "name": "LiteLLM",
+      "url": "https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json",
+      "sha256": "6b36efaf886fad9be3dadf5ac23e23900f9ad3e82874d69ef634f1707ffdfe35"
+    },
+    {
+      "name": "models.dev",
+      "url": "https://models.dev/api.json",
+      "sha256": "152b234c2738db110f5892ef9f4f6734696dde6d9f102b32e439b4dd09761359"
+    },
+    {
+      "name": "Fast facts",
+      "url": "https://github.com/openai/codex-token-overlay/blob/main/assets/pricing/fast-facts.json",
+      "sha256": "668966f33b5afde6656c8e0ec29bc929042fce1f5428b33f4cca11280a5a0e4e"
+    }
+  ]
+}

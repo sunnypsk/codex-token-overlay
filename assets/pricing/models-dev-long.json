@@ -1,0 +1,18 @@
+{
+  "openai": {
+    "models": {
+      "gpt-5.6-sol": {
+        "cost": { "input": 10, "cache_read": 1, "cache_write": 12.5, "output": 45 },
+        "limit": { "max_input_tokens": 1000000 }
+      },
+      "gpt-5.6-terra": {
+        "cost": { "input": 4, "cache_read": 0.4, "cache_write": 5, "output": 18 },
+        "limit": { "max_input_tokens": 1000000 }
+      },
+      "gpt-5.6-luna": {
+        "cost": { "input": 0.4, "cache_read": 0.04, "cache_write": 0.5, "output": 1.8 },
+        "limit": { "max_input_tokens": 1000000 }
+      }
+    }
+  }
+}

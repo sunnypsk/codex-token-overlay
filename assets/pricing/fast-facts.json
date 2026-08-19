@@ -1,0 +1,8 @@
+{
+  "gpt-5.6-sol": { "numerator": "2", "denominator": "1" },
+  "gpt-5.6-terra": { "numerator": "2", "denominator": "1" },
+  "gpt-5.6-luna": { "numerator": "2", "denominator": "1" },
+  "gpt-5.5": { "numerator": "5", "denominator": "2" },
+  "gpt-5.4": { "numerator": "2", "denominator": "1" },
+  "gpt-5.3-codex": { "numerator": "2", "denominator": "1" }
+}

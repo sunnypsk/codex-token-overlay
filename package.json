@@ -1,0 +1,84 @@
+{
+  "name": "codex-token-overlay",
+  "version": "0.1.1",
+  "description": "A Windows always-on-top overlay for Codex token usage, reset windows, and API-equivalent cost estimates.",
+  "main": "out/main/index.js",
+  "type": "module",
+  "packageManager": "pnpm@10.7.1",
+  "author": "Local",
+  "license": "MIT",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "build:app": "node scripts/generate-icon.mjs && electron-vite build",
+    "build": "pnpm typecheck && pnpm test && pnpm build:app",
+    "dist": "pnpm build && electron-builder --win nsis",
+    "test:e2e": "playwright test"
+  },
+  "dependencies": {
+    "lucide-react": "1.32.0",
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.62.1",
+    "@swc/core": "1.16.0",
+    "@testing-library/jest-dom": "7.0.1",
+    "@testing-library/react": "16.3.2",
+    "@types/node": "26.2.0",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.4",
+    "@vitejs/plugin-react": "5.2.0",
+    "electron": "43.4.0",
+    "electron-builder": "26.15.3",
+    "electron-vite": "5.0.0",
+    "jsdom": "30.0.1",
+    "typescript": "7.0.2",
+    "vite": "7.3.6",
+    "vitest": "4.1.11"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "@swc/core",
+      "electron",
+      "esbuild"
+    ]
+  },
+  "build": {
+    "appId": "com.local.codextokenoverlay",
+    "productName": "Codex Token Overlay",
+    "asar": true,
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "out/**/*",
+      "assets/pricing/**/*",
+      "THIRD_PARTY_NOTICES",
+      "package.json"
+    ],
+    "win": {
+      "icon": "build/icon.ico",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "Codex-Token-Overlay-${version}-Setup.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowElevation": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "deleteAppDataOnUninstall": false
+    }
+  }
+}

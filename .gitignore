@@ -1,0 +1,11 @@
+node_modules/
+build/
+out/
+release/
+coverage/
+playwright-report/
+test-results/
+*.log
+*.tsbuildinfo
+.DS_Store
+Thumbs.db

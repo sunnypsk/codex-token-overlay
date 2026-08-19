@@ -1,0 +1,49 @@
+Codex Token Overlay pricing snapshot
+
+ccusage
+  Reference: ccusage@914b4f4a562040fa0c4bf8d4dc7f3ae27d70e73c
+  Source: https://github.com/ryoppippi/ccusage/tree/914b4f4a562040fa0c4bf8d4dc7f3ae27d70e73c
+  License: MIT
+
+LiteLLM model pricing snapshot
+  Source: https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json
+  License: MIT
+  This application bundles an OpenAI/Codex-only normalized subset. Runtime
+  refreshes use a verified immutable commit URL and preserve source SHA/date.
+
+models.dev long-context supplement
+  Source: https://models.dev/api.json
+  License: MIT
+  This application bundles an OpenAI/Codex-only long-context supplement.
+
+Fast facts fixture
+  Source: https://github.com/openai/codex-token-overlay/blob/main/assets/pricing/fast-facts.json
+  SHA256: 668966f33b5afde6656c8e0ec29bc929042fce1f5428b33f4cca11280a5a0e4e
+  License: MIT; generated application provenance fixture, not a user override.
+
+MIT License
+
+Copyright (c) 2025 ccusage contributors
+Copyright (c) 2025 BerriAI and LiteLLM contributors
+Copyright (c) 2025 models.dev contributors
+Copyright (c) 2026 Codex Token Overlay contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+GeneratedAt: 2026-08-19T00:00:00.000Z
