@@ -67,12 +67,23 @@ export interface StoredSessionState {
   cycles: Record<string, StoredCycleAggregate>
   eventCount: number
   parseErrors: number
+  /** Fallback aggregate retained when a legacy prefix cannot be proven. */
+  legacyDaily?: Record<string, StoredDailyAggregate>
+  legacyCycles?: Record<string, StoredCycleAggregate>
+  legacyEventCount?: number
+  /** Pricing identity used for the last complete raw replay. */
+  pricingSemanticHash?: string | null
+  pricingIndexRevision?: number
   /** Set when v1 state cannot be reconciled to a rewritten/missing raw file. */
   legacyUnpriced?: boolean
   unreconciled?: boolean
   missingRaw?: boolean
   fingerprintBootstrapPending?: boolean
   baselineOffset?: number
+  baselinePrefixFingerprint?: string
+  baselineCumulative?: TokenBreakdown
+  baselineModel?: string
+  baselineServiceTier?: ServiceTier
 }
 
 export interface StoredAccountUsage {
@@ -130,6 +141,8 @@ export interface PersistentState {
   pendingPricingQueue: PendingPricingQueueEntry[]
   unreconciledSessions: string[]
   rebuild: RebuildProgress
+  /** Durable replay/migration revision for the indexed session projection. */
+  indexRevision: number
 }
 
 export interface PricingManifestPointer {
@@ -153,7 +166,8 @@ export function createDefaultState(now = new Date().toISOString()): PersistentSt
     pricingLedger: [],
     pendingPricingQueue: [],
     unreconciledSessions: [],
-    rebuild: { state: 'idle', totalFiles: 0, processedFiles: 0, pending: 0, message: null }
+    rebuild: { state: 'idle', totalFiles: 0, processedFiles: 0, pending: 0, message: null },
+    indexRevision: STATE_INDEX_REVISION
   }
 }
 
@@ -173,6 +187,9 @@ export interface StateStoreOptions {
   /** Disable the direct legacy fallback only in tests that explicitly want it. */
   legacyFallback?: boolean
 }
+
+/** Bump when the persisted session projection or replay rules change. */
+export const STATE_INDEX_REVISION = 3
 
 export class StateStore {
   private static readonly locks = new Map<string, Promise<void>>()
@@ -194,7 +211,7 @@ export class StateStore {
     for (const candidate of candidates) {
       const parsed = await this.readGeneration(candidate)
       if (parsed) {
-        this.state = parsed
+        this.state = await mergeLegacyV1Fallback(parsed, this.filePath)
         return this.state
       }
     }
@@ -311,31 +328,33 @@ export function migrateLegacyState(value: unknown): PersistentState {
   const defaults = createDefaultState()
   const version = source.version
   if (version === 2 && isStateV2(source)) {
-    const migratedSessions = normalizeV2Sessions(source.sessions)
+    const persistedRevision = numberOrZero(source.indexRevision)
+    const needsReplay = persistedRevision < STATE_INDEX_REVISION
+    const migratedSessions = normalizeV2Sessions(source.sessions, needsReplay)
     return {
       ...defaults,
       ...source,
       version: 2,
+      indexRevision: persistedRevision,
       sessions: migratedSessions,
       priceBook: normalizeLegacyPriceBook(source.priceBook, defaults.priceBook),
       pricingLedger: Array.isArray(source.pricingLedger) ? source.pricingLedger as PricingLedgerEntry[] : [],
-      pendingPricingQueue: Array.isArray(source.pendingPricingQueue) ? source.pendingPricingQueue as PendingPricingQueueEntry[] : [],
+      pendingPricingQueue: normalizePricingQueue(source.pendingPricingQueue),
       unreconciledSessions: Array.isArray(source.unreconciledSessions) ? source.unreconciledSessions.filter((item): item is string => typeof item === 'string') : [],
-      rebuild: isRecord(source.rebuild) ? normalizeRebuild(source.rebuild) : defaults.rebuild
+      rebuild: needsReplay
+        ? { state: 'queued', totalFiles: 0, processedFiles: 0, pending: Object.keys(migratedSessions).length, message: 'Indexed projection revision is old; awaiting atomic raw replay.' }
+        : isRecord(source.rebuild) ? normalizeRebuild(source.rebuild) : defaults.rebuild
     }
   }
   const sessions: Record<string, StoredSessionState> = {}
   if (isRecord(source.sessions)) {
     for (const [sessionId, raw] of Object.entries(source.sessions)) {
       if (!isRecord(raw)) continue
-      sessions[sessionId] = {
+      sessions[sessionId] = prepareLegacySession({
         ...(raw as unknown as StoredSessionState),
         sessionId: typeof raw.sessionId === 'string' ? raw.sessionId : sessionId,
         path: typeof raw.path === 'string' ? raw.path : '',
-        legacyUnpriced: true,
-        unreconciled: true,
-        missingRaw: true
-      }
+      })
     }
   }
   const account = isRecord(source.account) ? source.account : {}
@@ -357,7 +376,8 @@ export function migrateLegacyState(value: unknown): PersistentState {
     pricingLedger: [],
     pendingPricingQueue: [],
     unreconciledSessions: Object.keys(sessions),
-    rebuild: { state: 'queued', totalFiles: 0, processedFiles: 0, pending: Object.keys(sessions).length, message: 'Migrated from v1; awaiting background reconciliation.' }
+    rebuild: { state: 'queued', totalFiles: 0, processedFiles: 0, pending: Object.keys(sessions).length, message: 'Migrated from v1; awaiting background reconciliation.' },
+    indexRevision: 0
   }
 }
 
@@ -368,6 +388,7 @@ function normalizeLegacyPriceBook(value: unknown, fallback: StoredPriceBook): St
     ...fallback,
     ...(value as Partial<StoredPriceBook>),
     schemaVersion: 2,
+    normalizationRevision: typeof value.normalizationRevision === 'number' ? value.normalizationRevision : 0,
     models: Object.fromEntries(Object.entries(models).filter((entry) => isRecord(entry[1]))) as StoredPriceBook['models'],
     sourceQuality: value.sourceQuality === 'verified' || value.sourceQuality === 'observed' || value.sourceQuality === 'embedded' || value.sourceQuality === 'stale' || value.sourceQuality === 'unverified' ? value.sourceQuality : 'legacy',
     conflicts: Array.isArray(value.conflicts) ? value.conflicts : [],
@@ -388,19 +409,102 @@ function normalizeRebuild(value: Record<string, unknown>): RebuildProgress {
   }
 }
 
-function normalizeV2Sessions(value: unknown): Record<string, StoredSessionState> {
+function normalizeV2Sessions(value: unknown, needsReplay = false): Record<string, StoredSessionState> {
   if (!isRecord(value)) return {}
   const sessions: Record<string, StoredSessionState> = {}
   for (const [sessionId, raw] of Object.entries(value)) {
     if (!isRecord(raw)) continue
     const session = raw as unknown as StoredSessionState
-    sessions[sessionId] = {
+    const normalized: StoredSessionState = {
       ...session,
       sessionId: typeof session.sessionId === 'string' ? session.sessionId : sessionId,
-      fingerprintBootstrapPending: !session.prefixFingerprint || !session.recoveryAnchor
+      path: typeof session.path === 'string' ? session.path : '',
+      daily: isRecord(session.daily) ? session.daily : {},
+      cycles: isRecord(session.cycles) ? session.cycles : {},
+      fingerprintBootstrapPending: !session.prefixFingerprint || !session.recoveryAnchor,
+      pricingSemanticHash: typeof session.pricingSemanticHash === 'string' ? session.pricingSemanticHash : null,
+      pricingIndexRevision: numberOrZero(session.pricingIndexRevision)
     }
+    sessions[sessionId] = needsReplay ? prepareLegacySession(normalized) : normalized
   }
   return sessions
+}
+
+function normalizePricingQueue(value: unknown): PendingPricingQueueEntry[] {
+  if (!Array.isArray(value)) return []
+  return value.flatMap((raw) => {
+    if (!isRecord(raw)) return []
+    if (raw.status === 'complete' || raw.status === 'aborted') return []
+    const status = 'pending' as const
+    if (typeof raw.id !== 'string' || typeof raw.sessionId !== 'string' || typeof raw.filePath !== 'string') return []
+    return [{
+      id: raw.id,
+      sessionId: raw.sessionId,
+      filePath: raw.filePath,
+      capturedSize: numberOrZero(raw.capturedSize),
+      capturedOffset: numberOrZero(raw.capturedOffset),
+      queuedAt: typeof raw.queuedAt === 'string' ? raw.queuedAt : '',
+      // A process crash must never leave an immortal processing item.
+      status,
+      error: typeof raw.error === 'string' ? raw.error : null
+    } satisfies PendingPricingQueueEntry]
+  })
+}
+
+function prepareLegacySession(session: StoredSessionState): StoredSessionState {
+  const legacyDaily = session.legacyDaily ?? (Object.keys(session.daily ?? {}).length > 0 ? session.daily : undefined)
+  const legacyCycles = session.legacyCycles ?? (Object.keys(session.cycles ?? {}).length > 0 ? session.cycles : undefined)
+  const permanentFallback = Boolean((session.legacyDaily || session.legacyCycles) && session.legacyUnpriced === false)
+  return {
+    ...session,
+    daily: {},
+    cycles: {},
+    legacyDaily,
+    legacyCycles,
+    legacyEventCount: session.legacyEventCount ?? session.eventCount ?? 0,
+    eventCount: 0,
+    legacyUnpriced: permanentFallback ? false : true,
+    unreconciled: permanentFallback ? session.unreconciled === true : true,
+    missingRaw: permanentFallback ? session.missingRaw === true : true,
+    pricingSemanticHash: null,
+    pricingIndexRevision: 0
+  }
+}
+
+async function mergeLegacyV1Fallback(state: PersistentState, filePath: string): Promise<PersistentState> {
+  if (state.indexRevision >= STATE_INDEX_REVISION) return state
+  let raw: string
+  try {
+    raw = await readFile(filePath, 'utf8')
+  } catch {
+    return state
+  }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw) as unknown
+  } catch {
+    return state
+  }
+  if (!isRecord(parsed) || parsed.version !== 1 || !isStateLike(parsed)) return state
+  const legacy = migrateLegacyState(parsed)
+  for (const [sessionId, session] of Object.entries(legacy.sessions)) {
+    if (state.sessions[sessionId]) {
+      const current = state.sessions[sessionId]!
+      // The untouched v1 file is the authoritative legacy aggregate. Keep
+      // active-v2 metadata/settings elsewhere, but do not add both copies.
+      if (session.legacyDaily) current.legacyDaily = session.legacyDaily
+      if (session.legacyCycles) current.legacyCycles = session.legacyCycles
+      if (session.legacyEventCount !== undefined) current.legacyEventCount = session.legacyEventCount
+      current.legacyUnpriced = true
+      current.unreconciled = true
+      current.missingRaw = true
+      continue
+    }
+    state.sessions[sessionId] = session
+    if (!state.unreconciledSessions.includes(sessionId)) state.unreconciledSessions.push(sessionId)
+  }
+  state.rebuild = { state: 'queued', totalFiles: 0, processedFiles: 0, pending: Object.keys(state.sessions).length, message: 'Indexed projection is old; v1 fallback and raw replay are pending.' }
+  return state
 }
 
 async function writeDurably(path: string, content: string): Promise<void> {
@@ -431,7 +535,7 @@ function isStateLike(value: unknown): value is Record<string, unknown> {
 }
 
 function isStateV2(value: Record<string, unknown>): boolean {
-  return value.version === 2 && Array.isArray(value.pricingLedger) && Array.isArray(value.pendingPricingQueue)
+  return value.version === 2 && isRecord(value.settings) && isRecord(value.sessions) && isRecord(value.account) && isRecord(value.priceBook)
 }
 
 function isManifest(value: unknown): value is PricingManifestPointer {
@@ -454,6 +558,7 @@ function sha256(value: string): string {
 
 export const stateConstants = {
   STATE_VERSION: 2,
+  INDEX_REVISION: STATE_INDEX_REVISION,
   MANIFEST_SUFFIX: '.manifest.json',
   GENERATION_SUFFIX: '.generations',
   MAX_GENERATIONS_IN_MANIFEST: 2

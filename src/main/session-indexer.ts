@@ -21,10 +21,13 @@ import {
   createEmptyStoredSpeedAggregate,
   type StateStore,
   type StoredCycleAggregate,
+  type StoredDailyAggregate,
   type StoredModelAggregate,
+  type StoredSpeedAggregate,
   type StoredSessionState,
   type ServiceTier,
-  type ContextClass
+  type ContextClass,
+  STATE_INDEX_REVISION
 } from './state.js'
 
 export interface IndexerProgress {
@@ -51,6 +54,7 @@ const INDEX_INTERVAL_MS = 15_000
 export class SessionIndexer {
   private timer: NodeJS.Timeout | null = null
   private running: Promise<void> | null = null
+  private rerunRequested = false
   private stopped = false
   private progress: IndexerProgress = {
     state: 'idle',
@@ -82,8 +86,20 @@ export class SessionIndexer {
   }
 
   scan(): Promise<void> {
-    if (this.running) return this.running
-    this.running = this.performScan().finally(() => {
+    if (this.running) {
+      // Pricing updates can arrive while a scan is reading a raw prefix. Do
+      // not lose that invalidation; converge with one follow-up scan.
+      this.rerunRequested = true
+      return this.running
+    }
+    const run = this.performScan()
+    this.running = run.finally(() => {
+      if (this.rerunRequested && !this.stopped) {
+        this.rerunRequested = false
+        this.running = null
+        return this.scan()
+      }
+      this.rerunRequested = false
       this.running = null
     })
     return this.running
@@ -97,7 +113,7 @@ export class SessionIndexer {
     const nowSeconds = Math.floor(Date.now() / 1_000)
     let latest: StoredCycleAggregate | null = null
     for (const session of Object.values(this.store.get().sessions)) {
-      for (const cycle of Object.values(session.cycles)) {
+      for (const cycle of Object.values({ ...session.legacyCycles, ...session.cycles })) {
         if (cycle.limitId !== 'codex' || cycle.resetsAt <= nowSeconds) continue
         if (!latest || Date.parse(cycle.lastSampleAt) > Date.parse(latest.lastSampleAt)) latest = cycle
       }
@@ -129,6 +145,11 @@ export class SessionIndexer {
 
       const seenSessions = new Set(files.map((file) => file.sessionId))
       this.store.update((state) => {
+        // Processing is an in-memory lease. A restart turns it back into a
+        // retryable pending item; stale mtimes are superseded below.
+        for (const entry of state.pendingPricingQueue) {
+          if (entry.status === 'processing') entry.status = 'pending'
+        }
         for (const [sessionId, session] of Object.entries(state.sessions)) {
           if (seenSessions.has(sessionId)) continue
           session.legacyUnpriced = true
@@ -137,18 +158,7 @@ export class SessionIndexer {
           if (!state.unreconciledSessions.includes(sessionId)) state.unreconciledSessions.push(sessionId)
         }
         for (const candidate of files) {
-          const existing = state.pendingPricingQueue.find((entry) => entry.sessionId === candidate.sessionId && entry.capturedSize === candidate.size && entry.filePath === candidate.path)
-          if (existing) continue
-          state.pendingPricingQueue.push({
-            id: `${candidate.sessionId}:${candidate.size}:${candidate.modifiedAtMs}`,
-            sessionId: candidate.sessionId,
-            filePath: candidate.path,
-            capturedSize: candidate.size,
-            capturedOffset: state.sessions[candidate.sessionId]?.offset ?? 0,
-            queuedAt: new Date().toISOString(),
-            status: 'pending',
-            error: null
-          })
+          enqueueQueueEntry(state, candidate)
         }
       })
 
@@ -167,19 +177,23 @@ export class SessionIndexer {
 
       this.store.update((state) => {
         state.localIndexedAt = new Date().toISOString()
-        state.pendingPricingQueue = state.pendingPricingQueue.filter((entry) => entry.status !== 'complete')
-        state.unreconciledSessions = [...new Set(state.unreconciledSessions.filter((sessionId) => state.sessions[sessionId]?.unreconciled === true))]
+        // Terminal queue records are audit noise, not actionable work. Drop
+        // both completed and superseded entries after each convergence pass.
+        state.pendingPricingQueue = state.pendingPricingQueue.filter((entry) => entry.status !== 'complete' && entry.status !== 'aborted')
+        state.unreconciledSessions = Object.entries(state.sessions)
+          .filter(([, session]) => session.unreconciled === true)
+          .map(([sessionId]) => sessionId)
         const pending = state.pendingPricingQueue.filter((entry) => entry.status === 'pending' || entry.status === 'processing').length
         const unreconciled = state.unreconciledSessions.length
-        if (state.rebuild.state === 'indexing' || state.rebuild.state === 'validating' || state.rebuild.state === 'partial') {
-          state.rebuild.state = pending === 0 && unreconciled === 0 ? 'complete' : 'partial'
-          state.rebuild.totalFiles = files.length
-          state.rebuild.processedFiles = files.length - pending
-          state.rebuild.pending = pending
-          state.rebuild.message = pending === 0 && unreconciled === 0
-            ? null
-            : `Rebuild incomplete: ${pending} pending file(s), ${unreconciled} unreconciled session(s).`
-        }
+        const complete = pending === 0 && unreconciled === 0
+        state.rebuild.state = complete ? 'complete' : 'partial'
+        state.rebuild.totalFiles = files.length
+        state.rebuild.processedFiles = files.length - pending
+        state.rebuild.pending = pending
+        state.rebuild.message = complete
+          ? null
+          : `Rebuild incomplete: ${pending} pending file(s), ${unreconciled} unreconciled session(s).`
+        if (complete) state.indexRevision = STATE_INDEX_REVISION
       })
       await this.store.save()
       this.setProgress({
@@ -189,6 +203,21 @@ export class SessionIndexer {
         message: null
       })
     } catch (error) {
+      this.store.update((state) => {
+        state.pendingPricingQueue = state.pendingPricingQueue.filter((entry) => entry.status !== 'complete' && entry.status !== 'aborted')
+        state.unreconciledSessions = [...new Set([
+          ...state.unreconciledSessions,
+          ...Object.entries(state.sessions).filter(([, session]) => session.unreconciled === true).map(([sessionId]) => sessionId)
+        ])]
+        const pending = state.pendingPricingQueue.filter((entry) => entry.status === 'pending' || entry.status === 'processing').length
+        const unresolved = state.unreconciledSessions.length
+        state.rebuild.state = 'partial'
+        state.rebuild.totalFiles = this.progress.totalFiles
+        state.rebuild.processedFiles = Math.max(0, this.progress.indexedFiles - pending)
+        state.rebuild.pending = pending
+        state.rebuild.message = `Rebuild incomplete: ${pending} pending file(s), ${unresolved} unreconciled session(s).`
+      })
+      await this.store.save()
       this.setProgress({
         state: 'error',
         indexedFiles: this.progress.indexedFiles,
@@ -238,12 +267,18 @@ export class SessionIndexer {
 
   private async processFile(candidate: CandidateFile): Promise<void> {
     const stored = this.store.get().sessions[candidate.sessionId]
+    const replayForRevision = this.store.get().indexRevision < STATE_INDEX_REVISION
+    const replayForPricing = shouldReplayForPricing(stored, this.store.get().priceBook.payloadSha256 ?? null)
+    const hasReplayFloor = Boolean(stored && (stored.baselineOffset !== undefined || ((stored.legacyDaily || stored.legacyCycles) && stored.legacyUnpriced === false)))
+    const replayFromFloor = Boolean(hasReplayFloor && (replayForRevision || replayForPricing || stored?.missingRaw))
+    const forceReplay = replayFromFloor || replayForRevision || replayForPricing || Boolean(stored?.missingRaw && stored.legacyUnpriced)
     let sameSizeRewrite = false
-    if (stored && !stored.fingerprintBootstrapPending && stored.offset > 0 && (stored.offset < candidate.size || stored.modifiedAtMs !== candidate.modifiedAtMs || stored.fileSize !== candidate.size)) {
+    if (!forceReplay && stored && !stored.fingerprintBootstrapPending && stored.offset > 0 && (stored.offset < candidate.size || stored.modifiedAtMs !== candidate.modifiedAtMs || stored.fileSize !== candidate.size)) {
       const prefix = await fingerprintFilePrefix(candidate.path, stored.offset)
       if (!stored.prefixFingerprint || prefix !== stored.prefixFingerprint) sameSizeRewrite = true
     }
     if (
+      !forceReplay &&
       stored &&
       stored.fileSize === candidate.size &&
       stored.offset === candidate.size &&
@@ -252,7 +287,9 @@ export class SessionIndexer {
     ) {
       const fingerprint = await fingerprintFile(candidate.path)
       if (stored.contentFingerprint && stored.contentFingerprint === fingerprint) {
-        this.completeQueueEntry(`${candidate.sessionId}:${candidate.size}:${candidate.modifiedAtMs}`)
+        stored.pricingSemanticHash = this.store.get().priceBook.payloadSha256 ?? stored.pricingSemanticHash ?? null
+        stored.pricingIndexRevision = STATE_INDEX_REVISION
+        this.completeQueueEntry(queueIdentity(candidate))
         return
       }
       sameSizeRewrite = true
@@ -260,11 +297,11 @@ export class SessionIndexer {
 
     const backup = stored ? cloneSessionState(stored) : null
     try {
-      await this.processFileStage(candidate, sameSizeRewrite)
+      await this.processFileStage(candidate, sameSizeRewrite, forceReplay, replayFromFloor)
     } catch (error) {
       if (backup) this.store.get().sessions[candidate.sessionId] = backup
       else delete this.store.get().sessions[candidate.sessionId]
-      const queueId = `${candidate.sessionId}:${candidate.size}:${candidate.modifiedAtMs}`
+      const queueId = queueIdentity(candidate)
       this.store.update((state) => {
         const entry = state.pendingPricingQueue.find((item) => item.id === queueId)
         if (entry) {
@@ -276,13 +313,16 @@ export class SessionIndexer {
     }
   }
 
-  private async processFileStage(candidate: CandidateFile, sameSizeRewrite: boolean): Promise<void> {
+  private async processFileStage(candidate: CandidateFile, sameSizeRewrite: boolean, forceReplay: boolean, replayFromFloor: boolean): Promise<void> {
     const stored = this.store.get().sessions[candidate.sessionId]
 
-    let session = stored && stored.legacyUnpriced && stored.missingRaw
-      ? createSessionState(candidate)
-      : stored ? cloneSessionState(stored) : createSessionState(candidate)
-    const queueId = `${candidate.sessionId}:${candidate.size}:${candidate.modifiedAtMs}`
+    const replayFromRaw = forceReplay && !replayFromFloor
+    const replayFuture = replayFromFloor && Boolean(stored)
+    let session: StoredSessionState
+    if (replayFuture) session = createFutureReplaySession(candidate, stored!)
+    else if (replayFromRaw) session = createSessionState(candidate, stored)
+    else session = stored ? cloneSessionState(stored) : createSessionState(candidate)
+    const queueId = queueIdentity(candidate)
     this.store.update((state) => {
       const existing = state.pendingPricingQueue.find((entry) => entry.id === queueId)
       if (existing) existing.status = 'processing'
@@ -297,22 +337,72 @@ export class SessionIndexer {
         error: null
       })
     })
-    if (session.fingerprintBootstrapPending) {
+    if (stored && hasPersistedReplayFloor(stored) && !(await verifyBaselinePrefix(candidate.path, stored))) {
+      const rebaselined = await rebaselineSession(candidate, stored, this.store.get().priceBook.payloadSha256 ?? null)
+      this.store.get().sessions[candidate.sessionId] = rebaselined
+      this.store.update((state) => {
+        if (rebaselined.unreconciled) {
+          if (!state.unreconciledSessions.includes(candidate.sessionId)) state.unreconciledSessions.push(candidate.sessionId)
+        } else {
+          state.unreconciledSessions = state.unreconciledSessions.filter((sessionId) => sessionId !== candidate.sessionId)
+        }
+      })
+      this.completeQueueEntry(queueId)
+      return
+    }
+    if (!replayFromRaw && !replayFuture && session.fingerprintBootstrapPending) {
       const bootstrapped = await bootstrapSessionMetadata(candidate.path, session)
       if (!bootstrapped) {
-        session.legacyUnpriced = true
-        session.unreconciled = true
-        session.missingRaw = false
-        this.store.get().sessions[candidate.sessionId] = session
-        this.store.update((state) => {
-          if (!state.unreconciledSessions.includes(candidate.sessionId)) state.unreconciledSessions.push(candidate.sessionId)
-        })
+        const captured = await captureTailBaseline(candidate)
+        const baseline = captured.baseline
+        if (baseline) {
+          stashCurrentAggregates(session)
+          session.offset = captured.offset
+          session.fileSize = candidate.size
+          session.modifiedAtMs = candidate.modifiedAtMs
+          session.lastCumulative = baseline.cumulative
+          session.currentModel = baseline.model
+          session.lastEventModel = baseline.model
+          session.currentServiceTier = baseline.serviceTier
+          session.lastEventServiceTier = baseline.serviceTier
+          session.prefixFingerprint = captured.prefixFingerprint
+          session.contentFingerprint = captured.contentFingerprint
+          session.fingerprintBootstrapPending = false
+          session.legacyUnpriced = false
+          session.unreconciled = false
+          session.missingRaw = false
+          session.baselineOffset = captured.offset
+          session.baselinePrefixFingerprint = captured.prefixFingerprint
+          session.baselineCumulative = baseline.cumulative
+          session.baselineModel = baseline.model
+          session.baselineServiceTier = baseline.serviceTier
+          session.pricingSemanticHash = this.store.get().priceBook.payloadSha256 ?? null
+          session.pricingIndexRevision = STATE_INDEX_REVISION
+          this.store.get().sessions[candidate.sessionId] = session
+          this.store.update((state) => {
+            state.unreconciledSessions = state.unreconciledSessions.filter((sessionId) => sessionId !== candidate.sessionId)
+          })
+        } else {
+          // Keep the aggregate in a dedicated fallback slice and leave the
+          // session actionable for a later complete raw read. This prevents
+          // a transient read failure from tainting future appends forever.
+          stashCurrentAggregates(session)
+          session.legacyUnpriced = true
+          session.unreconciled = true
+          session.missingRaw = true
+          session.pricingSemanticHash = null
+          session.pricingIndexRevision = 0
+          this.store.get().sessions[candidate.sessionId] = session
+          this.store.update((state) => {
+            if (!state.unreconciledSessions.includes(candidate.sessionId)) state.unreconciledSessions.push(candidate.sessionId)
+          })
+        }
         this.completeQueueEntry(queueId)
         return
       }
       session = bootstrapped
     }
-    if (candidate.size < session.offset || sameSizeRewrite) {
+    if (!replayFromRaw && !replayFuture && (candidate.size < session.offset || sameSizeRewrite)) {
       const recovered = await recoverRewrittenSession(candidate.path, session)
       if (recovered.kind === 'unique') {
         session = {
@@ -327,18 +417,29 @@ export class SessionIndexer {
         }
       } else {
         session.path = candidate.path
-        session.offset = candidate.size
+        const captured = await captureTailBaseline(candidate)
+        session.offset = captured.offset
         session.fileSize = candidate.size
         session.modifiedAtMs = candidate.modifiedAtMs
-        session.lastCumulative = recovered.lastCumulative
-        session.legacyUnpriced = true
-        session.unreconciled = true
+        const rewriteBaseline = captured.baseline
+        session.lastCumulative = rewriteBaseline?.cumulative ?? recovered.lastCumulative
+        stashCurrentAggregates(session)
+        session.legacyUnpriced = false
+        // Ambiguous rewrites are resolved by the documented fallback policy:
+        // retain the old aggregate, baseline at the current tail, and price
+        // only future appends.
+        session.unreconciled = false
         session.missingRaw = false
-        session.prefixFingerprint = await fingerprintFilePrefix(candidate.path, candidate.size)
-        session.contentFingerprint = await fingerprintFile(candidate.path)
+        session.baselineOffset = captured.offset
+        session.baselinePrefixFingerprint = captured.prefixFingerprint
+        session.baselineCumulative = rewriteBaseline?.cumulative ?? recovered.lastCumulative ?? undefined
+        session.baselineModel = rewriteBaseline?.model ?? session.lastEventModel ?? session.currentModel
+        session.baselineServiceTier = rewriteBaseline?.serviceTier ?? session.lastEventServiceTier ?? session.currentServiceTier
+        session.prefixFingerprint = captured.prefixFingerprint
+        session.contentFingerprint = captured.contentFingerprint
         this.store.get().sessions[candidate.sessionId] = session
         this.store.update((state) => {
-          if (!state.unreconciledSessions.includes(candidate.sessionId)) state.unreconciledSessions.push(candidate.sessionId)
+          state.unreconciledSessions = state.unreconciledSessions.filter((sessionId) => sessionId !== candidate.sessionId)
         })
         this.completeQueueEntry(queueId)
         return
@@ -348,6 +449,15 @@ export class SessionIndexer {
 
     const completeEnd = await findLastCompleteLineEnd(candidate.path, session.offset, candidate.size)
     if (completeEnd <= session.offset) {
+      if (replayFromRaw && completeEnd <= 0) {
+        const fallback = preserveLegacyFallback(candidate, stored ?? session)
+        this.store.get().sessions[candidate.sessionId] = fallback
+        this.store.update((state) => {
+          if (!state.unreconciledSessions.includes(candidate.sessionId)) state.unreconciledSessions.push(candidate.sessionId)
+        })
+        this.completeQueueEntry(queueId)
+        return
+      }
       session.fileSize = candidate.size
       session.modifiedAtMs = candidate.modifiedAtMs
       session.prefixFingerprint = await fingerprintFilePrefix(candidate.path, session.offset)
@@ -359,6 +469,8 @@ export class SessionIndexer {
           state.unreconciledSessions = state.unreconciledSessions.filter((sessionId) => sessionId !== candidate.sessionId)
         })
       }
+      session.pricingSemanticHash = this.store.get().priceBook.payloadSha256 ?? null
+      session.pricingIndexRevision = STATE_INDEX_REVISION
       this.store.get().sessions[candidate.sessionId] = session
       this.completeQueueEntry(queueId)
       return
@@ -393,6 +505,28 @@ export class SessionIndexer {
         state.unreconciledSessions = state.unreconciledSessions.filter((sessionId) => sessionId !== candidate.sessionId)
       })
     }
+    if (replayFromRaw) {
+      delete session.legacyDaily
+      delete session.legacyCycles
+      delete session.legacyEventCount
+      delete session.baselineOffset
+      delete session.baselinePrefixFingerprint
+      delete session.baselineCumulative
+      delete session.baselineModel
+      delete session.baselineServiceTier
+      session.legacyUnpriced = false
+      session.unreconciled = false
+      session.missingRaw = false
+    }
+    if (replayFuture) {
+      // Reclassification after a pricing update only rebuilds the segment
+      // after the immutable fallback floor; legacy history stays unpriced.
+      session.legacyUnpriced = false
+      session.unreconciled = false
+      session.missingRaw = false
+    }
+    session.pricingSemanticHash = this.store.get().priceBook.payloadSha256 ?? null
+    session.pricingIndexRevision = STATE_INDEX_REVISION
     this.store.get().sessions[candidate.sessionId] = session
     this.completeQueueEntry(queueId)
   }
@@ -506,8 +640,8 @@ export class SessionIndexer {
   }
 }
 
-function createSessionState(candidate: CandidateFile): StoredSessionState {
-  return {
+function createSessionState(candidate: CandidateFile, fallback?: StoredSessionState): StoredSessionState {
+  const session: StoredSessionState = {
     sessionId: candidate.sessionId,
     path: candidate.path,
     offset: 0,
@@ -519,12 +653,263 @@ function createSessionState(candidate: CandidateFile): StoredSessionState {
     daily: {},
     cycles: {},
     eventCount: 0,
-    parseErrors: 0
+    parseErrors: 0,
+    pricingSemanticHash: null,
+    pricingIndexRevision: 0
   }
+  const legacyDaily = fallback?.legacyDaily ?? (fallback && Object.keys(fallback.daily ?? {}).length > 0 ? fallback.daily : undefined)
+  const legacyCycles = fallback?.legacyCycles ?? (fallback && Object.keys(fallback.cycles ?? {}).length > 0 ? fallback.cycles : undefined)
+  if (legacyDaily) session.legacyDaily = cloneJson(legacyDaily)
+  if (legacyCycles) session.legacyCycles = cloneJson(legacyCycles)
+  if (fallback?.legacyEventCount !== undefined || fallback?.eventCount !== undefined) {
+    session.legacyEventCount = fallback.legacyEventCount ?? fallback.eventCount
+  }
+  return session
+}
+
+function createFutureReplaySession(candidate: CandidateFile, stored: StoredSessionState): StoredSessionState {
+  const session = cloneSessionState(stored)
+  const floor = stored.baselineOffset ?? stored.offset
+  session.path = candidate.path
+  session.offset = floor
+  session.fileSize = 0
+  session.modifiedAtMs = 0
+  session.daily = {}
+  session.cycles = {}
+  session.eventCount = 0
+  session.parseErrors = 0
+  session.lastCumulative = stored.baselineCumulative ?? stored.lastCumulative
+  session.currentModel = stored.baselineModel ?? stored.currentModel
+  session.currentServiceTier = stored.baselineServiceTier ?? stored.currentServiceTier ?? 'unknown'
+  session.lastEventModel = stored.baselineModel
+  session.lastEventServiceTier = stored.baselineServiceTier
+  session.legacyUnpriced = false
+  session.unreconciled = false
+  session.missingRaw = false
+  session.pricingSemanticHash = null
+  session.pricingIndexRevision = 0
+  return session
 }
 
 function cloneSessionState(session: StoredSessionState): StoredSessionState {
   return JSON.parse(JSON.stringify(session)) as StoredSessionState
+}
+
+function cloneJson<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T
+}
+
+function queueIdentity(candidate: CandidateFile): string {
+  return `${candidate.sessionId}:${candidate.path}:${candidate.size}:${candidate.modifiedAtMs}`
+}
+
+function enqueueQueueEntry(state: ReturnType<StateStore['get']>, candidate: CandidateFile): void {
+  const id = queueIdentity(candidate)
+  for (const entry of state.pendingPricingQueue) {
+    if (entry.sessionId !== candidate.sessionId || entry.id === id) continue
+    if (entry.status === 'pending' || entry.status === 'processing') {
+      entry.status = 'aborted'
+      entry.error = 'Superseded by a newer file snapshot.'
+    }
+  }
+  const existing = state.pendingPricingQueue.find((entry) => entry.id === id)
+  if (existing) {
+    if (existing.status === 'aborted') existing.status = 'pending'
+    existing.filePath = candidate.path
+    existing.capturedSize = candidate.size
+    existing.capturedOffset = state.sessions[candidate.sessionId]?.offset ?? 0
+    existing.error = null
+    return
+  }
+  state.pendingPricingQueue.push({
+    id,
+    sessionId: candidate.sessionId,
+    filePath: candidate.path,
+    capturedSize: candidate.size,
+    capturedOffset: state.sessions[candidate.sessionId]?.offset ?? 0,
+    queuedAt: new Date().toISOString(),
+    status: 'pending',
+    error: null
+  })
+}
+
+function shouldReplayForPricing(session: StoredSessionState | undefined, currentHash: string | null): boolean {
+  if (!session) return false
+  if (!session.pricingSemanticHash || session.pricingIndexRevision !== STATE_INDEX_REVISION || !currentHash) return true
+  // Any semantic pricing change can alter short/long classification in either
+  // direction, so replay every raw-backed session rather than only unknown
+  // buckets.
+  return session.pricingSemanticHash !== currentHash
+}
+
+function hasPersistedReplayFloor(session: StoredSessionState): boolean {
+  return session.baselineOffset !== undefined || Boolean((session.legacyDaily || session.legacyCycles) && session.legacyUnpriced === false)
+}
+
+async function verifyBaselinePrefix(path: string, session: StoredSessionState): Promise<boolean> {
+  const offset = session.baselineOffset ?? session.offset
+  if (!Number.isSafeInteger(offset) || offset < 0 || !session.baselinePrefixFingerprint || !session.baselineCumulative) return false
+  if (offset === 0 && session.baselineCumulative.total !== '0') return false
+  try {
+    return await fingerprintFilePrefix(path, offset) === session.baselinePrefixFingerprint
+  } catch {
+    return false
+  }
+}
+
+async function rebaselineSession(
+  candidate: CandidateFile,
+  stored: StoredSessionState,
+  pricingHash: string | null
+): Promise<StoredSessionState> {
+  const session = cloneSessionState(stored)
+  const captured = await captureTailBaseline(candidate)
+  stashCurrentAggregates(session)
+  session.path = candidate.path
+  session.offset = captured.offset
+  session.fileSize = candidate.size
+  session.modifiedAtMs = candidate.modifiedAtMs
+  session.prefixFingerprint = captured.prefixFingerprint
+  session.contentFingerprint = captured.contentFingerprint
+  session.baselineOffset = captured.offset
+  session.baselinePrefixFingerprint = captured.prefixFingerprint
+  session.baselineCumulative = captured.baseline?.cumulative
+  session.baselineModel = captured.baseline?.model ?? session.currentModel
+  session.baselineServiceTier = captured.baseline?.serviceTier ?? session.currentServiceTier
+  session.recoveryAnchor = undefined
+  if (captured.baseline) {
+    session.lastCumulative = captured.baseline.cumulative
+    session.currentModel = captured.baseline.model
+    session.lastEventModel = captured.baseline.model
+    session.currentServiceTier = captured.baseline.serviceTier
+    session.lastEventServiceTier = captured.baseline.serviceTier
+    session.legacyUnpriced = false
+    session.unreconciled = false
+    session.missingRaw = false
+    session.pricingSemanticHash = pricingHash
+    session.pricingIndexRevision = STATE_INDEX_REVISION
+  } else {
+    session.lastCumulative = null
+    session.legacyUnpriced = true
+    session.unreconciled = true
+    session.missingRaw = true
+    session.pricingSemanticHash = null
+    session.pricingIndexRevision = 0
+  }
+  return session
+}
+
+function preserveLegacyFallback(candidate: CandidateFile, previous: StoredSessionState): StoredSessionState {
+  const fallback = createSessionState(candidate, previous)
+  fallback.legacyDaily = fallback.legacyDaily ?? (Object.keys(previous.daily ?? {}).length > 0 ? cloneJson(previous.daily) : undefined)
+  fallback.legacyCycles = fallback.legacyCycles ?? (Object.keys(previous.cycles ?? {}).length > 0 ? cloneJson(previous.cycles) : undefined)
+  fallback.legacyEventCount = previous.legacyEventCount ?? previous.eventCount
+  fallback.offset = 0
+  fallback.fileSize = 0
+  fallback.modifiedAtMs = 0
+  fallback.contentFingerprint = undefined
+  fallback.prefixFingerprint = undefined
+  fallback.recoveryAnchor = undefined
+  fallback.lastCumulative = previous.lastCumulative
+  fallback.currentModel = previous.currentModel
+  fallback.currentServiceTier = previous.currentServiceTier
+  fallback.lastEventModel = previous.lastEventModel
+  fallback.lastEventServiceTier = previous.lastEventServiceTier
+  fallback.legacyUnpriced = true
+  fallback.unreconciled = true
+  fallback.missingRaw = false
+  fallback.pricingSemanticHash = null
+  fallback.pricingIndexRevision = 0
+  return fallback
+}
+
+function stashCurrentAggregates(session: StoredSessionState): void {
+  if (Object.keys(session.daily).length > 0) {
+    const target = (session.legacyDaily ??= {})
+    mergeDailyRecords(target, session.daily)
+  }
+  if (Object.keys(session.cycles).length > 0) {
+    const target = (session.legacyCycles ??= {})
+    mergeCycleRecords(target, session.cycles)
+  }
+  session.legacyEventCount = (session.legacyEventCount ?? 0) + session.eventCount
+  session.daily = {}
+  session.cycles = {}
+  session.eventCount = 0
+}
+
+function mergeDailyRecords(target: Record<string, StoredDailyAggregate>, source: Record<string, StoredDailyAggregate>): void {
+  for (const [date, daily] of Object.entries(source)) {
+    const destination = (target[date] ??= { models: {} })
+    for (const [model, aggregate] of Object.entries(daily.models ?? {})) {
+      const current = destination.models[model]
+      destination.models[model] = current ? mergeModelAggregates(current, aggregate) : cloneJson(aggregate)
+    }
+  }
+}
+
+function mergeCycleRecords(target: Record<string, StoredCycleAggregate>, source: Record<string, StoredCycleAggregate>): void {
+  for (const [key, cycle] of Object.entries(source)) {
+    const current = target[key]
+    if (!current) {
+      target[key] = cloneJson(cycle)
+      continue
+    }
+    for (const [model, aggregate] of Object.entries(cycle.models ?? {})) {
+      const existing = current.models[model]
+      current.models[model] = existing ? mergeModelAggregates(existing, aggregate) : cloneJson(aggregate)
+    }
+    current.usedPercents = [...new Set([...current.usedPercents, ...cycle.usedPercents])].sort((left, right) => left - right)
+    current.firstSampleAt = minIso(current.firstSampleAt, cycle.firstSampleAt) ?? current.firstSampleAt
+    current.lastSampleAt = maxIso(current.lastSampleAt, cycle.lastSampleAt) ?? current.lastSampleAt
+  }
+}
+
+function mergeModelAggregates(target: StoredModelAggregate, source: StoredModelAggregate): StoredModelAggregate {
+  const result = cloneJson(target)
+  for (const context of ['short', 'long', 'unknown'] as const) {
+    result[context] = serializeTokens(addTokens(
+      deserializeTokens(result[context] ?? serializeTokens(zeroTokens())),
+      deserializeTokens(source[context] ?? serializeTokens(zeroTokens()))
+    ))
+  }
+  result.eventCount += source.eventCount
+  result.firstEventAt = minIso(result.firstEventAt, source.firstEventAt)
+  result.lastEventAt = maxIso(result.lastEventAt, source.lastEventAt)
+  const bySpeed = (result.bySpeed ??= {})
+  for (const [tier, speed] of Object.entries(source.bySpeed ?? {})) {
+    if (!speed) continue
+    const current = bySpeed[tier as ServiceTier]
+    bySpeed[tier as ServiceTier] = current ? mergeSpeedAggregates(current, speed) : cloneJson(speed)
+  }
+  return result
+}
+
+function mergeSpeedAggregates(target: StoredSpeedAggregate, source: StoredSpeedAggregate): StoredSpeedAggregate {
+  const result = cloneJson(target)
+  for (const context of ['short', 'long', 'unknown'] as const) {
+    result[context] = serializeTokens(addTokens(
+      deserializeTokens(result[context] ?? serializeTokens(zeroTokens())),
+      deserializeTokens(source[context] ?? serializeTokens(zeroTokens()))
+    ))
+  }
+  result.eventCount += source.eventCount
+  result.lowerBound ||= source.lowerBound === true
+  result.firstEventAt = minIso(result.firstEventAt, source.firstEventAt)
+  result.lastEventAt = maxIso(result.lastEventAt, source.lastEventAt)
+  return result
+}
+
+function minIso(left: string | undefined, right: string | undefined): string | undefined {
+  if (!left) return right
+  if (!right) return left
+  return left < right ? left : right
+}
+
+function maxIso(left: string | undefined, right: string | undefined): string | undefined {
+  if (!left) return right
+  if (!right) return left
+  return left > right ? left : right
 }
 
 async function fingerprintFile(path: string): Promise<string> {
@@ -641,6 +1026,60 @@ async function bootstrapSessionMetadata(path: string, session: StoredSessionStat
         }
       : {})
   }
+}
+
+async function readLatestBaseline(path: string, capturedEnd?: number): Promise<{ cumulative: TokenBreakdown; model: string; serviceTier: ServiceTier } | null> {
+  let content: Buffer
+  try {
+    content = await readFile(path)
+  } catch {
+    return null
+  }
+  const end = capturedEnd === undefined ? content.byteLength : Math.max(0, Math.min(capturedEnd, content.byteLength))
+  let currentModel = 'unknown'
+  let currentServiceTier: ServiceTier = 'unknown'
+  let latest: { cumulative: TokenBreakdown; model: string; serviceTier: ServiceTier } | null = null
+  for (const line of content.subarray(0, end).toString('utf8').split(/\n/)) {
+    if (!line.trim()) continue
+    try {
+      const row = JSON.parse(line) as unknown
+      if (!isRecord(row) || !isRecord(row.payload)) continue
+      const payload = row.payload
+      if (row.type === 'turn_context' && typeof payload.model === 'string') currentModel = payload.model
+      if (payload.type === 'thread_settings_applied' || row.type === 'thread_settings_applied') currentServiceTier = extractServiceTier(payload) ?? currentServiceTier
+      if (payload.type !== 'token_count' || !isRecord(payload.info)) continue
+      const usage = fromUnknownTokenUsage(payload.info.total_token_usage)
+      if (!usage) continue
+      const model = extractEventModel(payload, payload.info) ?? currentModel
+      const serviceTier = extractServiceTier(payload) ?? currentServiceTier
+      latest = { cumulative: serializeTokens(usage), model, serviceTier }
+    } catch {
+      // A trailing partial line does not invalidate the last complete
+      // cumulative baseline; the normal stream boundary handles it later.
+      continue
+    }
+  }
+  return latest
+}
+
+interface CapturedTailBaseline {
+  offset: number
+  prefixFingerprint: string
+  contentFingerprint: string
+  baseline: { cumulative: TokenBreakdown; model: string; serviceTier: ServiceTier } | null
+}
+
+async function captureTailBaseline(candidate: CandidateFile): Promise<CapturedTailBaseline> {
+  let offset = await findLastCompleteLineEnd(candidate.path, 0, candidate.size)
+  // Only parse records through the exact newline boundary. A syntactically
+  // valid newline-less tail is deliberately excluded until its newline is
+  // observed, keeping cumulative, fingerprint, and offset aligned.
+  const baseline = await readLatestBaseline(candidate.path, offset)
+  const [prefixFingerprint, contentFingerprint] = await Promise.all([
+    fingerprintFilePrefix(candidate.path, offset),
+    fingerprintFile(candidate.path)
+  ])
+  return { offset, prefixFingerprint, contentFingerprint, baseline }
 }
 
 async function recoverRewrittenSession(

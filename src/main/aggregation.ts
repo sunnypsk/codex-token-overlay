@@ -47,7 +47,16 @@ interface ModelAggregateBig extends ContextUsage {
   firstEventAt?: string
   lastEventAt?: string
   bySpeed?: Partial<Record<ServiceTier, { short: BigTokenBreakdown; long: BigTokenBreakdown; unknown?: BigTokenBreakdown; eventCount: number; firstEventAt?: string; lastEventAt?: string }>>
-  legacyUnpriced?: boolean
+  /** Legacy fallback is a separate slice so future appends remain priceable. */
+  legacy?: ModelAggregateSlice
+}
+
+interface ModelAggregateSlice extends ContextUsage {
+  unknown?: BigTokenBreakdown
+  eventCount: number
+  firstEventAt?: string
+  lastEventAt?: string
+  bySpeed?: Partial<Record<ServiceTier, { short: BigTokenBreakdown; long: BigTokenBreakdown; unknown?: BigTokenBreakdown; eventCount: number; firstEventAt?: string; lastEventAt?: string }>>
 }
 
 type ModelsBig = Record<string, ModelAggregateBig>
@@ -316,9 +325,15 @@ function buildResetSummary(
 function aggregateDailyModels(state: PersistentState, dates: Set<string>): ModelsBig {
   const models: ModelsBig = {}
   for (const session of Object.values(state.sessions)) {
+    for (const [date, daily] of Object.entries(session.legacyDaily ?? {})) {
+      if (!dates.has(date)) continue
+      mergeStoredModels(models, daily.models, true)
+    }
     for (const [date, daily] of Object.entries(session.daily)) {
       if (!dates.has(date)) continue
-      mergeStoredModels(models, daily.models, session.legacyUnpriced === true)
+      // Compatibility for pre-revision v1 objects that have no dedicated
+      // legacyDaily slice yet.
+      mergeStoredModels(models, daily.models, session.legacyUnpriced === true && !session.legacyDaily)
     }
   }
   return models
@@ -327,6 +342,18 @@ function aggregateDailyModels(state: PersistentState, dates: Set<string>): Model
 function aggregateCycles(state: PersistentState): AggregatedCycle[] {
   const cycles = new Map<string, AggregatedCycle>()
   for (const session of Object.values(state.sessions)) {
+    for (const [key, stored] of Object.entries(session.legacyCycles ?? {})) {
+      const cycle = cycles.get(key) ?? {
+        limitId: stored.limitId,
+        resetsAt: stored.resetsAt,
+        windowDurationMins: stored.windowDurationMins,
+        models: {},
+        usedPercents: new Set<number>()
+      }
+      mergeStoredModels(cycle.models, stored.models, true)
+      for (const percent of stored.usedPercents) cycle.usedPercents.add(percent)
+      cycles.set(key, cycle)
+    }
     for (const [key, stored] of Object.entries(session.cycles)) {
       const cycle = cycles.get(key) ?? {
         limitId: stored.limitId,
@@ -335,7 +362,7 @@ function aggregateCycles(state: PersistentState): AggregatedCycle[] {
         models: {},
         usedPercents: new Set<number>()
       }
-      mergeStoredModels(cycle.models, stored.models, session.legacyUnpriced === true)
+      mergeStoredModels(cycle.models, stored.models, session.legacyUnpriced === true && !session.legacyCycles)
       for (const percent of stored.usedPercents) cycle.usedPercents.add(percent)
       cycles.set(key, cycle)
     }
@@ -352,14 +379,21 @@ function mergeStoredModels(target: ModelsBig, source: Record<string, StoredModel
       eventCount: 0,
       bySpeed: {}
     })
-    aggregate.short = addTokens(aggregate.short, deserializeTokens(stored.short))
-    aggregate.long = addTokens(aggregate.long, deserializeTokens(stored.long))
-    aggregate.unknown = addTokens(aggregate.unknown ?? zeroTokens(), deserializeTokens(stored.unknown ?? serializeTokens(zeroTokens())))
-    aggregate.eventCount += stored.eventCount
-    aggregate.firstEventAt = minIso(aggregate.firstEventAt, stored.firstEventAt)
-    aggregate.lastEventAt = maxIso(aggregate.lastEventAt, stored.lastEventAt)
-    aggregate.legacyUnpriced ||= legacyUnpriced
-    const aggregateBySpeed = (aggregate.bySpeed ??= {})
+    const destination = legacyUnpriced
+      ? (aggregate.legacy ??= { short: zeroTokens(), long: zeroTokens(), unknown: zeroTokens(), eventCount: 0, bySpeed: {} })
+      : aggregate
+    mergeAggregateSlice(destination, stored)
+  }
+}
+
+function mergeAggregateSlice(target: ModelAggregateSlice, stored: StoredModelAggregate): void {
+    target.short = addTokens(target.short, deserializeTokens(stored.short))
+    target.long = addTokens(target.long, deserializeTokens(stored.long))
+    target.unknown = addTokens(target.unknown ?? zeroTokens(), deserializeTokens(stored.unknown ?? serializeTokens(zeroTokens())))
+    target.eventCount += stored.eventCount
+    target.firstEventAt = minIso(target.firstEventAt, stored.firstEventAt)
+    target.lastEventAt = maxIso(target.lastEventAt, stored.lastEventAt)
+    const aggregateBySpeed = (target.bySpeed ??= {})
     for (const [speed, speedStored] of Object.entries(stored.bySpeed ?? {})) {
       if (!isServiceTier(speed)) continue
       const speedAggregate = (aggregateBySpeed[speed] ??= {
@@ -389,13 +423,13 @@ function mergeStoredModels(target: ModelsBig, source: Record<string, StoredModel
       speedAggregate.unknown = addTokens(speedAggregate.unknown ?? zeroTokens(), deserializeTokens(stored.unknown ?? serializeTokens(zeroTokens())))
       speedAggregate.eventCount += stored.eventCount
     }
-  }
 }
 
 function sumModels(models: ModelsBig): BigTokenBreakdown {
   let total = zeroTokens()
   for (const usage of Object.values(models)) {
     total = addTokens(total, addTokens(addTokens(usage.short, usage.long), usage.unknown ?? zeroTokens()))
+    if (usage.legacy) total = addTokens(total, addTokens(addTokens(usage.legacy.short, usage.legacy.long), usage.legacy.unknown ?? zeroTokens()))
   }
   return total
 }
@@ -424,72 +458,84 @@ function calculateCostSummary(
 
   for (const [model, usage] of Object.entries(models)) {
     const combined = addTokens(addTokens(usage.short, usage.long), usage.unknown ?? zeroTokens())
-    localTokens += combined.total
-    const price = usage.legacyUnpriced ? undefined : resolveModelPrice(priceBook, model, { exactOnly: false })
-    const bySpeed = usage.bySpeed && Object.keys(usage.bySpeed).length > 0
-      ? usage.bySpeed
-      : { standard: { short: usage.short, long: usage.long, unknown: usage.unknown, eventCount: usage.eventCount } }
+    const totalWithLegacy = usage.legacy
+      ? addTokens(combined, addTokens(addTokens(usage.legacy.short, usage.legacy.long), usage.legacy.unknown ?? zeroTokens()))
+      : combined
+    localTokens += totalWithLegacy.total
+    const segments: Array<{ usage: ModelAggregateSlice; legacy: boolean }> = [
+      { usage, legacy: false },
+      ...(usage.legacy ? [{ usage: usage.legacy, legacy: true }] : [])
+    ]
     let modelAtto = 0n
     let modelPriced = 0n
     let modelUnpriced = 0n
     let modelLowerBound = false
-    for (const speed of ['standard', 'fast', 'unknown'] as const) {
-      const speedUsage = bySpeed[speed]
-      if (!speedUsage) continue
-      const speedUnknown = speedUsage.unknown ?? zeroTokens()
-      const speedTokens = addTokens(addTokens(speedUsage.short, speedUsage.long), speedUnknown)
-      const fastFact = speed === 'fast' && speedUsage.firstEventAt
-        ? fastFactForModel(model, priceBook, speedUsage.firstEventAt)
-        : null
-      const baseEffective = price?.base?.effectiveAt
-      const longEffective = price?.longComponent?.effectiveAt
-      const beforeBase = Boolean(baseEffective && speedUsage.firstEventAt && speedUsage.firstEventAt < baseEffective)
-      const beforeLong = Boolean(longEffective && speedUsage.long.total > 0n && speedUsage.firstEventAt && speedUsage.firstEventAt < longEffective)
-      const effectivePrice = beforeBase || beforeLong ? undefined : price
-      const result = calculateModelCostDetailed(
-        { short: speedUsage.short, long: speedUsage.long },
-        effectivePrice,
-        { fast: speed === 'fast', fastFact }
-      )
-      const isUnknownSpeed = speed === 'unknown'
-      const unknownContextTokens = speedUnknown.total
-      const speedUnpricedTokens = (result.unpricedTokens ?? 0n) + unknownContextTokens
-      const speedLowerBound = result.lowerBound === true || isUnknownSpeed || unknownContextTokens > 0n || usage.legacyUnpriced === true
-      const tier = tierTotals[speed]
-      tier.shortTokens += speedUsage.short.total
-      tier.longTokens += speedUsage.long.total
-      tier.unknownTokens += unknownContextTokens
-      tier.pricedTokens += result.pricedTokens
-      tier.unpricedTokens += speedUnpricedTokens
-      if (speed === 'fast' && fastFact && !result.lowerBound) tier.premiumVerifiedTokens += result.pricedTokens
-      tier.lowerBound ||= speedLowerBound
-      if (isUnknownSpeed) unknownSpeedTokens += speedTokens.total
-      totalAttoUsd += result.attoUsd ?? 0n
-      totalPricedTokens += result.pricedTokens
-      totalUnpricedTokens += speedUnpricedTokens
-      modelAtto += result.attoUsd ?? 0n
-      modelPriced += result.pricedTokens
-      modelUnpriced += speedUnpricedTokens
-      modelLowerBound ||= speedLowerBound
-      lowerBound ||= speedLowerBound
+    let summaryPrice: ReturnType<typeof resolveModelPrice> | undefined
+    for (const segment of segments) {
+      const segmentUsage = segment.usage
+      const price = segment.legacy ? undefined : resolveModelPrice(priceBook, model, { exactOnly: false })
+      if (price) summaryPrice = price
+      const bySpeed = segmentUsage.bySpeed && Object.keys(segmentUsage.bySpeed).length > 0
+        ? segmentUsage.bySpeed
+        : { standard: { short: segmentUsage.short, long: segmentUsage.long, unknown: segmentUsage.unknown, eventCount: segmentUsage.eventCount } }
+      for (const speed of ['standard', 'fast', 'unknown'] as const) {
+        const speedUsage = bySpeed[speed]
+        if (!speedUsage) continue
+        const speedUnknown = speedUsage.unknown ?? zeroTokens()
+        const speedTokens = addTokens(addTokens(speedUsage.short, speedUsage.long), speedUnknown)
+        const fastFact = !segment.legacy && speed === 'fast' && speedUsage.firstEventAt
+          ? fastFactForModel(model, priceBook, speedUsage.firstEventAt)
+          : null
+        const baseEffective = price?.base?.effectiveAt
+        const longEffective = price?.longComponent?.effectiveAt
+        const beforeBase = Boolean(baseEffective && speedUsage.firstEventAt && speedUsage.firstEventAt < baseEffective)
+        const beforeLong = Boolean(longEffective && speedUsage.long.total > 0n && speedUsage.firstEventAt && speedUsage.firstEventAt < longEffective)
+        const effectivePrice = segment.legacy || beforeBase || beforeLong ? undefined : price
+        const result = calculateModelCostDetailed(
+          { short: speedUsage.short, long: speedUsage.long },
+          effectivePrice,
+          { fast: speed === 'fast', fastFact }
+        )
+        const isUnknownSpeed = speed === 'unknown'
+        const unknownContextTokens = speedUnknown.total
+        const speedUnpricedTokens = (result.unpricedTokens ?? 0n) + unknownContextTokens
+        const speedLowerBound = result.lowerBound === true || isUnknownSpeed || unknownContextTokens > 0n || segment.legacy
+        const tier = tierTotals[speed]
+        tier.shortTokens += speedUsage.short.total
+        tier.longTokens += speedUsage.long.total
+        tier.unknownTokens += unknownContextTokens
+        tier.pricedTokens += result.pricedTokens
+        tier.unpricedTokens += speedUnpricedTokens
+        if (speed === 'fast' && fastFact && !result.lowerBound) tier.premiumVerifiedTokens += result.pricedTokens
+        tier.lowerBound ||= speedLowerBound
+        if (isUnknownSpeed) unknownSpeedTokens += speedTokens.total
+        totalAttoUsd += result.attoUsd ?? 0n
+        totalPricedTokens += result.pricedTokens
+        totalUnpricedTokens += speedUnpricedTokens
+        modelAtto += result.attoUsd ?? 0n
+        modelPriced += result.pricedTokens
+        modelUnpriced += speedUnpricedTokens
+        modelLowerBound ||= speedLowerBound
+        lowerBound ||= speedLowerBound
+      }
     }
-    if (modelPriced < combined.total) unknownModels.add(model)
+    if (modelPriced < totalWithLegacy.total) unknownModels.add(model)
     modelSummaries.push({
       model,
-      tokens: serializeTokens(combined),
+      tokens: serializeTokens(totalWithLegacy),
       apiEquivalentMicroUsd: modelPriced > 0n ? roundAttoUsdToMicroUsd(modelAtto).toString() : null,
       pricedTokens: modelPriced.toString(),
       unpricedTokens: modelUnpriced.toString(),
       lowerBound: modelLowerBound,
-      source: price?.base
+      source: summaryPrice?.base
         ? {
-            componentId: price.base.componentId,
-            source: price.base.source,
-            sourceUrl: price.base.sourceUrl,
-            sourceSha256: price.base.sourceSha256,
-            effectiveAt: price.base.effectiveAt,
-            observedAt: price.base.observedAt,
-            quality: price.base.quality
+            componentId: summaryPrice.base.componentId,
+            source: summaryPrice.base.source,
+            sourceUrl: summaryPrice.base.sourceUrl,
+            sourceSha256: summaryPrice.base.sourceSha256,
+            effectiveAt: summaryPrice.base.effectiveAt,
+            observedAt: summaryPrice.base.observedAt,
+            quality: summaryPrice.base.quality
           }
         : undefined
     })
@@ -503,7 +549,7 @@ function calculateCostSummary(
   const localCoveragePercent = accountDenominator === null ? null : percent(localTokens, accountDenominator)
   const priceCoveragePercent = localTokens > 0n ? percent(totalPricedTokens, localTokens) : null
   const recordedTierTokens = tierTotals.standard.shortTokens + tierTotals.standard.longTokens + tierTotals.standard.unknownTokens + tierTotals.fast.shortTokens + tierTotals.fast.longTokens + tierTotals.fast.unknownTokens + tierTotals.unknown.shortTokens + tierTotals.unknown.longTokens + tierTotals.unknown.unknownTokens
-  const knownTierTokens = recordedTierTokens - (tierTotals.unknown.shortTokens + tierTotals.unknown.longTokens)
+  const knownTierTokens = recordedTierTokens - (tierTotals.unknown.shortTokens + tierTotals.unknown.longTokens + tierTotals.unknown.unknownTokens)
   const tierCoveragePercent = recordedTierTokens > 0n ? percent(knownTierTokens, recordedTierTokens) : null
   const recordedFastTokens = tierTotals.fast.shortTokens + tierTotals.fast.longTokens + tierTotals.fast.unknownTokens
   const verifiedFastTokens = tierTotals.fast.premiumVerifiedTokens

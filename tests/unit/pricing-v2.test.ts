@@ -12,6 +12,7 @@ import {
   fetchTextWithTimeout,
   mergePricingSources,
   normalizeLiteLLMPriceBook,
+  normalizeModelsDevPriceBook,
   reduceRational,
   roundAttoUsdToMicroUsd,
   resolveEffectiveModelPricing,
@@ -36,13 +37,19 @@ describe('structured pricing v2 contracts', () => {
     })
   })
 
-  it('keeps a complete LiteLLM long component ahead of a supplement', () => {
+  it('uses an explicit complete LiteLLM long component without treating capacity as a rate discriminator', () => {
     const base = normalizeLiteLLMPriceBook({
       'gpt-5.4': {
         input_cost_per_token: 0.000002,
         cache_read_input_token_cost: 0.0000002,
         output_cost_per_token: 0.000012,
-        max_input_tokens: 272000
+        max_input_tokens: 1000000,
+        long_context: {
+          input_cost_per_token: 0.000004,
+          cache_read_input_token_cost: 0.0000004,
+          output_cost_per_token: 0.000024,
+          max_input_tokens: 1000000
+        }
       }
     })
     const supplement = normalizeLiteLLMPriceBook({
@@ -56,6 +63,78 @@ describe('structured pricing v2 contracts', () => {
     const merged = mergePricingSources({ base, longSupplement: supplement })
     expect(merged.models['gpt-5.4']?.long?.inputMicroUsdPerMillion).toBe('4000000')
     expect(merged.conflicts).toHaveLength(0)
+    expect(normalizeLiteLLMPriceBook({
+      'gpt-5.4': {
+        input_cost_per_token: 0.000002,
+        cache_read_input_token_cost: 0.0000002,
+        output_cost_per_token: 0.000012,
+        max_input_tokens: 1000000,
+        max_tokens: 1000000
+      }
+    })['gpt-5.4']?.long).toBeNull()
+  })
+
+  it('uses the verified 272K contract threshold instead of long-row capacity', () => {
+    const model = normalizeLiteLLMPriceBook({
+      'gpt-5.4': {
+        input_cost_per_token: 0.000002,
+        cache_read_input_token_cost: 0.0000002,
+        output_cost_per_token: 0.000012,
+        max_input_tokens: 1_000_000,
+        max_tokens: 131_072,
+        long_context: {
+          input_cost_per_token: 0.000004,
+          cache_read_input_token_cost: 0.0000004,
+          output_cost_per_token: 0.000024,
+          max_input_tokens: 1_000_000
+        }
+      }
+    })['gpt-5.4']!
+    expect(model.longContextThreshold).toBe('272000')
+    const book = createBundledPriceBook()
+    book.models['gpt-5.4'] = {
+      ...book.models['gpt-5.4']!,
+      short: model.short,
+      long: model.long,
+      longContextThreshold: model.longContextThreshold
+    }
+    expect(resolveEffectiveModelPricing(book, 'gpt-5.4', '2026-08-19T02:00:00.000Z').longContextThreshold).toBe(272000n)
+  })
+
+  it('records divergent complete long components while retaining LiteLLM precedence', () => {
+    const base = normalizeLiteLLMPriceBook({
+      'gpt-5.4': {
+        input_cost_per_token: 0.000002,
+        cache_read_input_token_cost: 0.0000002,
+        output_cost_per_token: 0.000012,
+        long_context: { input_cost_per_token: 0.000004, cache_read_input_token_cost: 0.0000004, output_cost_per_token: 0.000024 }
+      }
+    })
+    const divergent = normalizeLiteLLMPriceBook({
+      'gpt-5.4': {
+        input_cost_per_token: 0.000002,
+        cache_read_input_token_cost: 0.0000002,
+        output_cost_per_token: 0.000012,
+        long_context: { input_cost_per_token: 0.000007, cache_read_input_token_cost: 0.0000007, output_cost_per_token: 0.000042 }
+      }
+    })
+    const merged = mergePricingSources({ base, longSupplement: divergent })
+    expect(merged.models['gpt-5.4']?.long?.inputMicroUsdPerMillion).toBe('4000000')
+    expect(merged.conflicts).toEqual([expect.objectContaining({ model: 'gpt-5.4', component: 'long' })])
+  })
+
+  it('keeps realistic Sol/Terra/Luna LiteLLM bases and atomically adds pinned long rates', () => {
+    const base = normalizeLiteLLMPriceBook({
+      'gpt-5.6-sol': { input_cost_per_token: 0.000005, cache_read_input_token_cost: 0.0000005, output_cost_per_token: 0.00003, max_input_tokens: 1000000, max_tokens: 131072, litellm_provider: 'openai' },
+      'gpt-5.6-terra': { input_cost_per_token: 0.000002, cache_read_input_token_cost: 0.0000002, output_cost_per_token: 0.000012, max_input_tokens: 1000000, max_tokens: 131072, litellm_provider: 'openai' },
+      'gpt-5.6-luna': { input_cost_per_token: 0.0000002, cache_read_input_token_cost: 0.00000002, output_cost_per_token: 0.0000012, max_input_tokens: 1000000, max_tokens: 131072, litellm_provider: 'codex' }
+    })
+    const supplement = normalizeModelsDevPriceBook(JSON.parse(readFileSync(join(process.cwd(), 'assets', 'pricing', 'models-dev-long.json'), 'utf8')))
+    const merged = mergePricingSources({ base, longSupplement: supplement })
+    expect(merged.conflicts).toEqual([])
+    expect(merged.models['gpt-5.6-sol']).toMatchObject({ short: { inputMicroUsdPerMillion: '5000000' }, long: { inputMicroUsdPerMillion: '10000000' }, longContextThreshold: '272000' })
+    expect(merged.models['gpt-5.6-terra']).toMatchObject({ short: { inputMicroUsdPerMillion: '2000000' }, long: { inputMicroUsdPerMillion: '4000000' } })
+    expect(merged.models['gpt-5.6-luna']).toMatchObject({ short: { inputMicroUsdPerMillion: '200000' }, long: { inputMicroUsdPerMillion: '400000' } })
   })
 
   it('prices each bucket and rounds once at the microUSD boundary', () => {
@@ -133,6 +212,53 @@ describe('structured pricing v2 contracts', () => {
     expect(updates).toBe(1)
   })
 
+  it('bootstraps stale/legacy books immediately while a fresh verified book obeys the interval', async () => {
+    const { PricingService } = await import('../../src/main/pricing.js')
+    const fresh = createBundledPriceBook('2026-08-19T00:00:00.000Z')
+    fresh.stale = false
+    fresh.sourceQuality = 'verified'
+    fresh.checkedAt = new Date().toISOString()
+    let freshCalls = 0
+    const freshService = new PricingService(() => fresh, () => undefined, () => undefined, async () => {
+      freshCalls += 1
+      return new Response('{}', { status: 200 })
+    })
+    await freshService.refreshIfDue()
+    expect(freshCalls).toBe(0)
+
+    const stale = { ...fresh, sourceQuality: 'legacy' as const, models: { broken: {} as never } }
+    const saved: { book?: ReturnType<typeof createBundledPriceBook> } = {}
+    const staleService = new PricingService(() => stale, (next) => { saved.book = next }, () => undefined, async () => new Response('{}', { status: 200 }))
+    await staleService.refreshIfDue()
+    expect(saved.book?.sourceQuality).toBe('embedded')
+    expect(saved.book?.models['gpt-5.6-sol']?.long).toBeDefined()
+  })
+
+  it('preserves stale verified last-good pricing across repeated refresh failures', async () => {
+    const { PricingService } = await import('../../src/main/pricing.js')
+    let book = createBundledPriceBook('2026-08-18T00:00:00.000Z')
+    book.models['gpt-5.4'] = { ...book.models['gpt-5.4']!, short: { ...book.models['gpt-5.4']!.short, inputMicroUsdPerMillion: '777' } }
+    book.payloadSha256 = canonicalPricingHash(book.models)
+    book.sourceQuality = 'verified'
+    book.stale = true
+    book.checkedAt = '2026-08-18T00:00:00.000Z'
+    let calls = 0
+    const service = new PricingService(
+      () => book,
+      (next) => { book = next },
+      () => undefined,
+      async () => {
+        calls += 1
+        return new Response('{}', { status: 200 })
+      }
+    )
+    await service.refreshIfDue()
+    await service.refreshIfDue()
+    expect(calls).toBe(2)
+    expect(book.sourceQuality).toBe('verified')
+    expect(book.models['gpt-5.4']?.short.inputMicroUsdPerMillion).toBe('777')
+  })
+
   it('refreshes changed models.dev misses even when LiteLLM is 304', async () => {
     const previous = createBundledPriceBook('2026-08-19T00:00:00.000Z')
     previous.sourceCommit = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
@@ -156,6 +282,18 @@ describe('structured pricing v2 contracts', () => {
     expect(result.book.liveModelsDevObservedAt).toBe(now)
     expect(result.book.liveModelsDevPayloadSha256).not.toBe('old-payload')
     expect(result.book.payloadSha256).not.toBe(previous.payloadSha256)
+  })
+
+  it('keeps an all-304 semantic pricing refresh as a no-op', async () => {
+    const previous = createBundledPriceBook('2026-08-19T00:00:00.000Z')
+    previous.sourceCommit = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    previous.sourceEffectiveAt = '2026-08-18T00:00:00.000Z'
+    previous.commitEtag = 'commit-old'
+    previous.sourceEtag = 'raw-old'
+    const result = await fetchStructuredPriceBook(previous, async () => new Response(null, { status: 304 }), '2026-08-19T04:00:00.000Z')
+    expect(result.notModified).toBe(true)
+    expect(result.book.payloadSha256).toBe(previous.payloadSha256)
+    expect(result.book.updatedAt).toBe(previous.updatedAt)
   })
 
   it('aborts a partial streaming body instead of accepting the first chunk', async () => {

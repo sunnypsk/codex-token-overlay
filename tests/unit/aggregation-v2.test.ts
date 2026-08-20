@@ -105,4 +105,27 @@ describe('aggregation v2 coverage dimensions', () => {
     expect(period.cost.lowerBound).toBe(true)
     expect(period.cost.unpricedTokens).toBe('0')
   })
+
+  it('subtracts unknown-tier short, long, and unknown-context tokens from tier coverage', () => {
+    const state = createDefaultState()
+    const usage = createEmptyStoredModelAggregate()
+    const unknownSpeed = {
+      short: { input: '10', cachedInput: '0', cacheWriteInput: '0', output: '0', reasoningOutput: '0', total: '10' },
+      long: { input: '20', cachedInput: '0', cacheWriteInput: '0', output: '0', reasoningOutput: '0', total: '20' },
+      unknown: { input: '30', cachedInput: '0', cacheWriteInput: '0', output: '0', reasoningOutput: '0', total: '30' },
+      eventCount: 3
+    }
+    usage.bySpeed = { unknown: unknownSpeed }
+    usage.short = unknownSpeed.short
+    usage.long = unknownSpeed.long
+    usage.unknown = unknownSpeed.unknown
+    state.sessions.unknownTier = {
+      sessionId: 'unknownTier', path: 'test.jsonl', offset: 0, fileSize: 0, modifiedAtMs: 0,
+      currentModel: 'gpt-5.6-sol', lastCumulative: null,
+      daily: { '2026-08-19': { models: { 'gpt-5.6-sol': usage } } },
+      cycles: {}, eventCount: 3, parseErrors: 0
+    }
+    const period = buildPeriod('today', Date.parse('2026-08-18T16:00:00Z'), Date.parse('2026-08-19T04:00:00Z'), state)
+    expect(period.cost.tierCoveragePercent).toBe(0)
+  })
 })

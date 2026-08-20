@@ -54,7 +54,15 @@ export class UsageService extends EventEmitter {
           })
         }
       }),
-      () => this.emitSnapshot(),
+      () => {
+        this.emitSnapshot()
+        // A semantic pricing change invalidates unknown-context sessions;
+        // scanning here converges the projection without waiting for the
+        // periodic index interval. Startup creates the indexer after the
+        // initial pricing refresh, so it cannot replay against an invalid
+        // legacy book.
+        void this.indexer?.scan()
+      },
       (input, init) => net.fetch(input, init)
     )
   }
@@ -62,7 +70,8 @@ export class UsageService extends EventEmitter {
   async start(): Promise<void> {
     await this.store.load()
     this.stopped = false
-    this.pricing.start()
+    await this.pricing.refreshIfDue()
+    this.pricing.start(false)
     this.rateTimer = setInterval(() => void this.syncRateLimits(), RATE_LIMIT_POLL_MS)
     this.usageTimer = setInterval(() => void this.syncAccountUsage(), ACCOUNT_USAGE_POLL_MS)
     void this.connect()

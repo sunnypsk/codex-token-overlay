@@ -1,11 +1,13 @@
-import { appendFile, mkdir, mkdtemp, stat, utimes, writeFile, rm } from 'node:fs/promises'
+import { appendFile, mkdir, mkdtemp, readFile, stat, utimes, writeFile, rm } from 'node:fs/promises'
 import { readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
 import { afterEach, describe, expect, it } from 'vitest'
 import { SessionIndexer, type SessionReadStreamFactory } from '../../src/main/session-indexer.js'
-import { StateStore } from '../../src/main/state.js'
+import { createDefaultState, createEmptyStoredModelAggregate, StateStore } from '../../src/main/state.js'
+import { buildPeriod } from '../../src/main/aggregation.js'
+import { canonicalPricingHash } from '../../src/main/pricing.js'
 
 const roots: string[] = []
 
@@ -14,6 +16,195 @@ afterEach(async () => {
 })
 
 describe('session reconciliation v2', () => {
+  it('replays an actual v1 baseline once, preserves the legacy file, and records the exact raw offset', async () => {
+    const { file, root, sessionId } = await makeSession(tokenLine(76_240_615, 0, 0, 76_240_615), 'gpt-5.6-sol')
+    const statePath = join(root, 'usage-state.json')
+    const aggregate = createEmptyStoredModelAggregate()
+    aggregate.short = { input: '76240615', cachedInput: '0', cacheWriteInput: '0', output: '0', reasoningOutput: '0', total: '76240615' }
+    const v1 = {
+      version: 1,
+      settings: { alwaysOnTop: false, startAtLogin: true, expanded: true },
+      window: { x: 11, y: 22 },
+      sessions: {
+        [sessionId]: {
+          sessionId,
+          path: file,
+          offset: 0,
+          fileSize: 0,
+          modifiedAtMs: 0,
+          currentModel: 'gpt-5.6-sol',
+          lastCumulative: null,
+          daily: { '2026-08-19': { models: { 'gpt-5.6-sol': aggregate } } },
+          cycles: {},
+          eventCount: 1,
+          parseErrors: 0
+        }
+      },
+      account: { lifetimeTokens: '76240615', peakDailyTokens: null, dailyUsageBuckets: {}, syncedAt: null },
+      rateLimits: [],
+      rateLimitsSyncedAt: null,
+      priceBook: createDefaultState().priceBook,
+      localIndexedAt: null
+    }
+    const legacyContent = `${JSON.stringify(v1)}\n`
+    await writeFile(statePath, legacyContent, 'utf8')
+    const store = new StateStore(statePath)
+    await store.load()
+    await new SessionIndexer(root, store, 0, () => undefined).scan()
+    const session = store.get().sessions[sessionId]!
+    expect(session.daily['2026-08-19']?.models['gpt-5.6-sol']?.long.total).toBe('76240615')
+    expect(session.legacyDaily).toBeUndefined()
+    expect(session.offset).toBe((await stat(file)).size)
+    expect(store.get().rebuild.state).toBe('complete')
+    expect(store.get().pendingPricingQueue).toHaveLength(0)
+    await rm(file)
+    await new SessionIndexer(root, store, 0, () => undefined).scan()
+    expect(store.get().rebuild.state).toBe('partial')
+    expect(store.get().pendingPricingQueue).toHaveLength(0)
+    expect(await readFile(statePath, 'utf8')).toBe(legacyContent)
+  })
+
+  it('keeps a missing v1 raw session as an unpriced fallback without an immortal queue item', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'codex-missing-v1-'))
+    roots.push(root)
+    const statePath = join(root, 'usage-state.json')
+    const aggregate = createEmptyStoredModelAggregate()
+    aggregate.short = { input: '100', cachedInput: '0', cacheWriteInput: '0', output: '0', reasoningOutput: '0', total: '100' }
+    await writeFile(statePath, `${JSON.stringify({
+      version: 1,
+      settings: { alwaysOnTop: true, startAtLogin: true, expanded: false },
+      window: { x: null, y: null },
+      sessions: {
+        missing: {
+          sessionId: 'missing', path: join(root, 'sessions', 'missing.jsonl'), offset: 0, fileSize: 0, modifiedAtMs: 0,
+          currentModel: 'gpt-5.6-sol', lastCumulative: null, daily: { '2026-08-19': { models: { 'gpt-5.6-sol': aggregate } } },
+          cycles: {}, eventCount: 1, parseErrors: 0
+        }
+      },
+      account: { lifetimeTokens: null, peakDailyTokens: null, dailyUsageBuckets: {}, syncedAt: null },
+      rateLimits: [], rateLimitsSyncedAt: null, priceBook: createDefaultState().priceBook, localIndexedAt: null
+    })}\n`, 'utf8')
+    const store = new StateStore(statePath)
+    await store.load()
+    await new SessionIndexer(root, store, 0, () => undefined).scan()
+    expect(store.get().sessions.missing?.legacyDaily?.['2026-08-19']?.models['gpt-5.6-sol']?.short.total).toBe('100')
+    expect(store.get().pendingPricingQueue).toHaveLength(0)
+    expect(store.get().rebuild.state).toBe('partial')
+    expect(store.get().unreconciledSessions).toContain('missing')
+  })
+
+  it('reindexes unknown context after a semantic pricing update without changing totals', async () => {
+    const { file, root, sessionId } = await makeSession(tokenLine(300_000, 0, 0, 300_000), 'gpt-5.4')
+    const store = new StateStore(join(root, 'state.json'))
+    await store.load()
+    const oldBook = createDefaultState().priceBook
+    oldBook.models['gpt-5.4'] = {
+      ...oldBook.models['gpt-5.4']!,
+      long: null,
+      longContextThreshold: null,
+      longComponent: undefined
+    }
+    oldBook.payloadSha256 = canonicalPricingHash(oldBook.models)
+    store.update((state) => { state.priceBook = oldBook })
+    const indexer = new SessionIndexer(root, store, 0, () => undefined)
+    await indexer.scan()
+    const before = store.get().sessions[sessionId]!
+    expect(before.daily['2026-08-19']?.models['gpt-5.4']?.unknown?.total).toBe('300000')
+    const totalBefore = before.daily['2026-08-19']?.models['gpt-5.4']?.short.total
+      ?? '0'
+    const refreshed = createDefaultState().priceBook
+    store.update((state) => { state.priceBook = refreshed })
+    await indexer.scan()
+    const after = store.get().sessions[sessionId]!
+    expect(after.daily['2026-08-19']?.models['gpt-5.4']?.unknown?.total ?? '0').toBe('0')
+    expect(after.daily['2026-08-19']?.models['gpt-5.4']?.long.total).toBe('300000')
+    expect(after.daily['2026-08-19']?.models['gpt-5.4']?.short.total).toBe(totalBefore)
+    expect(after.pricingSemanticHash).toBe(refreshed.payloadSha256)
+    expect((after.daily['2026-08-19']?.models['gpt-5.4']?.long.total ?? '0')).toBe('300000')
+    expect((await stat(file)).size).toBe(after.offset)
+  })
+
+  it('rebaselines a rewritten floor before pricing a later 540 cumulative append', async () => {
+    const { file, root, sessionId } = await makeSession(tokenLine(100, 60, 10, 110), 'gpt-5.6-sol')
+    const store = new StateStore(join(root, 'state.json'))
+    await store.load()
+    const indexer = new SessionIndexer(root, store, 0, () => undefined)
+    await indexer.scan()
+
+    const original = await readText(file)
+    const firstRewrite = rewriteJsonlExact(original, (value) => {
+      if (value.payload?.type === 'token_count') {
+        value.payload.info.total_token_usage = { input_tokens: 200, cached_input_tokens: 80, cache_write_input_tokens: 0, output_tokens: 20, reasoning_output_tokens: 5, total_tokens: 220 }
+        value.payload.info.last_token_usage = { input_tokens: 200, cached_input_tokens: 80, cache_write_input_tokens: 0, output_tokens: 20, reasoning_output_tokens: 5, total_tokens: 220 }
+      }
+      return value
+    })
+    await writeFile(file, firstRewrite, 'utf8')
+    await indexer.scan()
+    expect(store.get().sessions[sessionId]?.baselineCumulative?.total).toBe('220')
+
+    await appendFile(file, tokenLine(480, 360, 20, 500) + '\n', 'utf8')
+    await indexer.scan()
+    const currentPrefix = rewriteJsonlExact(await readText(file), (value) => {
+      if (value.type === 'turn_context') value.payload.model = 'gpt-5.6'
+      return value
+    })
+    await writeFile(file, currentPrefix, 'utf8')
+    const changedPricing = createDefaultState().priceBook
+    changedPricing.models['gpt-5.6'] = { ...changedPricing.models['gpt-5.6']!, longContextThreshold: '1' }
+    changedPricing.payloadSha256 = canonicalPricingHash(changedPricing.models)
+    store.update((state) => { state.priceBook = changedPricing })
+    await indexer.scan()
+    const rebaselined = store.get().sessions[sessionId]!
+    expect(rebaselined.baselineCumulative?.total).toBe('500')
+    expect(rebaselined.baselinePrefixFingerprint).toBeDefined()
+    expect(rebaselined.daily['2026-08-19']?.models['gpt-5.6']).toBeUndefined()
+    expect(rebaselined.legacyDaily?.['2026-08-19']?.models['gpt-5.6-sol']?.short.total).toBe('390')
+
+    await appendFile(file, tokenLine(520, 400, 20, 540) + '\n', 'utf8')
+    await indexer.scan()
+    const after = store.get().sessions[sessionId]!
+    expect(after.daily['2026-08-19']?.models['gpt-5.6']?.long?.total).toBe('40')
+    expect(after.legacyDaily?.['2026-08-19']?.models['gpt-5.6-sol']?.short.total).toBe('390')
+    const period = buildPeriod('today', Date.parse('2026-08-18T16:00:00Z'), Date.parse('2026-08-19T04:00:00Z'), store.get())
+    expect(period.tokens.total).toBe('430')
+    expect(period.cost.pricedTokens).toBe('40')
+    expect(period.cost.unpricedTokens).toBe('390')
+  })
+
+  it('excludes a valid newline-less token tail, then counts it once when newline arrives', async () => {
+    const { file, root, sessionId } = await makeSession(tokenLine(100, 60, 10, 110), 'gpt-5.6-sol')
+    const store = new StateStore(join(root, 'state.json'))
+    await store.load()
+    const indexer = new SessionIndexer(root, store, 0, () => undefined)
+    await indexer.scan()
+    const rewritten = rewriteJsonlExact(await readText(file), (value) => {
+      if (value.payload?.type === 'token_count') {
+        value.payload.info.total_token_usage = { input_tokens: 200, cached_input_tokens: 80, cache_write_input_tokens: 0, output_tokens: 20, reasoning_output_tokens: 5, total_tokens: 220 }
+        value.payload.info.last_token_usage = { input_tokens: 200, cached_input_tokens: 80, cache_write_input_tokens: 0, output_tokens: 20, reasoning_output_tokens: 5, total_tokens: 220 }
+      }
+      return value
+    })
+    await writeFile(file, rewritten, 'utf8')
+    await indexer.scan()
+    const floorOffset = store.get().sessions[sessionId]?.baselineOffset
+    expect(store.get().sessions[sessionId]?.baselineCumulative?.total).toBe('220')
+    expect(floorOffset).toBe((await stat(file)).size)
+
+    const future = tokenLine(480, 360, 20, 500)
+    await appendFile(file, future, 'utf8')
+    await indexer.scan()
+    expect(store.get().sessions[sessionId]?.daily['2026-08-19']?.models['gpt-5.6-sol']).toBeUndefined()
+    expect(store.get().sessions[sessionId]?.baselineOffset).toBe(floorOffset)
+
+    await appendFile(file, '\n', 'utf8')
+    await indexer.scan()
+    expect(store.get().sessions[sessionId]?.daily['2026-08-19']?.models['gpt-5.6-sol']?.short.total).toBe('280')
+    expect(store.get().sessions[sessionId]?.lastCumulative?.total).toBe('500')
+    await indexer.scan()
+    expect(store.get().sessions[sessionId]?.daily['2026-08-19']?.models['gpt-5.6-sol']?.short.total).toBe('280')
+  })
+
   it('detects a same-size content rewrite even when only the fingerprint changes', async () => {
     const { file, root, sessionId } = await makeSession(tokenLine(100, 60, 10, 110))
     const store = new StateStore(join(root, 'state.json'))
@@ -23,7 +214,7 @@ describe('session reconciliation v2', () => {
     const before = store.get().sessions[sessionId]!
     const original = await readText(file)
     const rewritten = rewriteJsonlExact(original, (value) => {
-      if (value.type === 'turn_context') value.payload.model = 'gpt-5.4-sol'
+      if (value.type === 'turn_context') value.payload.model = 'gpt-5.6-sol'
       if (value.payload?.type === 'thread_settings_applied') value.payload.settings.service_tier = 'priority'
       if (value.payload?.type === 'token_count') {
         value.payload.info.total_token_usage = { input_tokens: 200, cached_input_tokens: 80, cache_write_input_tokens: 0, output_tokens: 20, reasoning_output_tokens: 5, total_tokens: 220 }
@@ -37,12 +228,30 @@ describe('session reconciliation v2', () => {
     expect((await stat(file)).size).toBe(Buffer.byteLength(original))
     await indexer.scan()
     const after = store.get().sessions[sessionId]!
-    expect(after.daily['2026-08-19']?.models['gpt-5.6-sol']?.short.total).toBe(before.daily['2026-08-19']?.models['gpt-5.6-sol']?.short.total)
-    expect(after.unreconciled).toBe(true)
-    expect(after.legacyUnpriced).toBe(true)
-    await appendFile(file, tokenLine(240, 200, 20, 260) + '\n', 'utf8')
+    expect(after.legacyDaily?.['2026-08-19']?.models['gpt-5.6-sol']?.short.total).toBe(before.daily['2026-08-19']?.models['gpt-5.6-sol']?.short.total)
+    expect(after.daily['2026-08-19']?.models['gpt-5.6-sol']).toBeUndefined()
+    expect(after.unreconciled).toBe(false)
+    expect(after.legacyUnpriced).toBe(false)
+    await appendFile(file, tokenLine(240, 120, 20, 260) + '\n', 'utf8')
     await indexer.scan()
-    expect(store.get().sessions[sessionId]?.daily['2026-08-19']?.models['gpt-5.6-sol']?.short.total).toBe('150')
+    expect(store.get().sessions[sessionId]?.legacyDaily?.['2026-08-19']?.models['gpt-5.6-sol']?.short.total).toBe('110')
+    expect(store.get().sessions[sessionId]?.daily['2026-08-19']?.models['gpt-5.6-sol']?.short.total).toBe('40')
+    const period = buildPeriod('today', Date.parse('2026-08-18T16:00:00Z'), Date.parse('2026-08-19T04:00:00Z'), store.get())
+    expect(period.tokens.total).toBe('150')
+    expect(period.cost.pricedTokens).toBe('40')
+    expect(period.cost.unpricedTokens).toBe('110')
+    const changedPricing = createDefaultState().priceBook
+    changedPricing.models['gpt-5.6-sol'] = { ...changedPricing.models['gpt-5.6-sol']!, longContextThreshold: '1' }
+    changedPricing.payloadSha256 = canonicalPricingHash(changedPricing.models)
+    store.update((state) => { state.priceBook = changedPricing })
+    await indexer.scan()
+    const reclassified = store.get().sessions[sessionId]!
+    expect(reclassified.legacyDaily?.['2026-08-19']?.models['gpt-5.6-sol']?.short.total).toBe('110')
+    expect(reclassified.daily['2026-08-19']?.models['gpt-5.6-sol']?.long.total).toBe('40')
+    const afterPricing = buildPeriod('today', Date.parse('2026-08-18T16:00:00Z'), Date.parse('2026-08-19T04:00:00Z'), store.get())
+    expect(afterPricing.tokens.total).toBe('150')
+    expect(afterPricing.cost.pricedTokens).toBe('40')
+    expect(afterPricing.cost.unpricedTokens).toBe('110')
   })
 
   it('rejects a unique cumulative anchor when metadata before it changed', async () => {
@@ -60,8 +269,8 @@ describe('session reconciliation v2', () => {
     expect(Buffer.byteLength(original)).toBe(Buffer.byteLength(rewritten))
     await writeFile(file, rewritten, 'utf8')
     await indexer.scan()
-    expect(store.get().sessions[sessionId]?.unreconciled).toBe(true)
-    expect(store.get().sessions[sessionId]?.legacyUnpriced).toBe(true)
+    expect(store.get().sessions[sessionId]?.unreconciled).toBe(false)
+    expect(store.get().sessions[sessionId]?.legacyUnpriced).toBe(false)
   })
 
   it('does not reconcile a trailing-partial file after its processed prefix changes', async () => {
@@ -87,7 +296,7 @@ describe('session reconciliation v2', () => {
     expect(persisted.fileSize).toBe(normalizedStats.size)
     expect(persisted.modifiedAtMs).toBe(normalizedStats.mtimeMs)
     await indexer.scan()
-    expect(store.get().sessions[sessionId]?.unreconciled).toBe(true)
+    expect(store.get().sessions[sessionId]?.unreconciled).toBe(false)
   })
 
   it('stages a failed file read and retries without double-counting', async () => {
@@ -109,6 +318,7 @@ describe('session reconciliation v2', () => {
     await failing.scan()
     expect(store.get().sessions[sessionId]?.daily['2026-08-19']?.models['gpt-5.6-sol']?.short.total).toBe(before.daily['2026-08-19']?.models['gpt-5.6-sol']?.short.total)
     expect(store.get().pendingPricingQueue.some((entry) => entry.status === 'pending')).toBe(true)
+    expect(store.get().rebuild.state).toBe('partial')
     const retry = new SessionIndexer(root, store, 0, () => undefined)
     await retry.scan()
     expect(store.get().sessions[sessionId]?.daily['2026-08-19']?.models['gpt-5.6-sol']?.short.total).toBe('200')
@@ -162,8 +372,12 @@ describe('session reconciliation v2', () => {
     expect(reloaded.get().sessions[sessionId]?.fingerprintBootstrapPending).toBe(true)
     await new SessionIndexer(root, reloaded, 0, () => undefined).scan()
     const rejected = reloaded.get().sessions[sessionId]!
-    expect(rejected.legacyUnpriced).toBe(true)
-    expect(rejected.unreconciled).toBe(true)
+    expect(rejected.legacyUnpriced).toBe(false)
+    expect(rejected.unreconciled).toBe(false)
+    expect(rejected.legacyDaily?.['2026-08-19']?.models['gpt-5.6-sol']?.short.total).toBe('110')
+    await appendFile(file, tokenLine(180, 120, 20, 200) + '\n', 'utf8')
+    await new SessionIndexer(root, reloaded, 0, () => undefined).scan()
+    expect(reloaded.get().sessions[sessionId]?.daily['2026-08-19']?.models['gpt-5.4-sol']?.unknown?.total).toBe('90')
   })
 })
 

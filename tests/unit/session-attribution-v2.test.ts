@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { sessionIndexerInternals } from '../../src/main/session-indexer.js'
 import { SessionIndexer } from '../../src/main/session-indexer.js'
 import { StateStore } from '../../src/main/state.js'
-import { createBundledPriceBook, resolveEffectiveModelPricing } from '../../src/main/pricing.js'
+import { createBundledPriceBook, normalizeLiteLLMPriceBook, resolveEffectiveModelPricing } from '../../src/main/pricing.js'
 
 const roots: string[] = []
 afterEach(async () => { await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))) })
@@ -76,6 +76,37 @@ describe('session pricing attribution v2', () => {
     expect(models?.['gpt-5.5']?.short?.total).toBe('210000')
     expect(models?.['gpt-5.5']?.long?.total).toBe('280000')
     expect(resolveEffectiveModelPricing(book, 'gpt-5.4', '2026-08-19T02:00:01.000Z').longContextThreshold).toBe(200000n)
+  })
+
+  it('classifies 300K as long when LiteLLM capacity is 1M', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'codex-capacity-v2-'))
+    roots.push(root)
+    const sessions = join(root, 'sessions', '2026', '08', '19')
+    await mkdir(sessions, { recursive: true })
+    const sessionId = '01a00000-0000-7000-8000-000000000086'
+    const file = join(sessions, `rollout-2026-08-19T10-00-00-${sessionId}.jsonl`)
+    await writeFile(file, `${JSON.stringify({ timestamp: '2026-08-19T02:00:00.000Z', type: 'turn_context', payload: { model: 'gpt-5.4' } })}\n${JSON.stringify(tokenEvent('2026-08-19T02:00:01.000Z', 300000, 300000, 'gpt-5.4'))}\n`, 'utf8')
+    const store = new StateStore(join(root, 'state.json'))
+    await store.load()
+    const parsed = normalizeLiteLLMPriceBook({
+      'gpt-5.4': {
+        input_cost_per_token: 0.000002,
+        cache_read_input_token_cost: 0.0000002,
+        output_cost_per_token: 0.000012,
+        max_input_tokens: 1_000_000,
+        long_context: {
+          input_cost_per_token: 0.000004,
+          cache_read_input_token_cost: 0.0000004,
+          output_cost_per_token: 0.000024,
+          max_input_tokens: 1_000_000
+        }
+      }
+    })['gpt-5.4']!
+    const book = createBundledPriceBook()
+    book.models['gpt-5.4'] = { ...book.models['gpt-5.4']!, short: parsed.short, long: parsed.long, longContextThreshold: parsed.longContextThreshold }
+    store.update((state) => { state.priceBook = book })
+    await new SessionIndexer(root, store, 0, () => undefined).scan()
+    expect(store.get().sessions[sessionId]?.daily['2026-08-19']?.models['gpt-5.4']?.long?.total).toBe('300000')
   })
 })
 

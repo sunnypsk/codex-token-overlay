@@ -71,6 +71,8 @@ export interface StoredPriceBook {
   message: string | null
   models: Record<string, StoredModelPrice>
   schemaVersion?: 2
+  /** Persisted normalization contract; old books must bootstrap again. */
+  normalizationRevision?: number
   sourceSha256?: string | null
   sourceEtag?: string | null
   commitEtag?: string | null
@@ -154,6 +156,7 @@ const STALE_AFTER_MS = 36 * 60 * 60 * 1_000
 const REQUEST_TIMEOUT_MS = 10_000
 const MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 const LONG_CONTEXT_THRESHOLD = 272_000n
+export const PRICING_NORMALIZATION_REVISION = 3
 
 const LITELLM_SOURCE_URL = `https://github.com/${LITELLM_OWNER}/${LITELLM_REPOSITORY}/blob/${LITELLM_BRANCH}/${LITELLM_PATH}`
 const MODELS_DEV_SOURCE_URL = MODELS_DEV_URL
@@ -207,8 +210,8 @@ export class PricingService {
     private readonly legacyBrowserFallback?: () => Promise<string>
   ) {}
 
-  start(): void {
-    void this.refreshIfDue()
+  start(refreshImmediately = true): void {
+    if (refreshImmediately) void this.refreshIfDue()
     this.timer = setInterval(() => void this.refreshIfDue(), PRICE_CHECK_INTERVAL_MS)
   }
 
@@ -228,7 +231,8 @@ export class PricingService {
   private async performRefresh(force: boolean): Promise<void> {
     const current = ensurePriceBook(this.getPriceBook())
     const checkedAt = current.checkedAt ? Date.parse(current.checkedAt) : 0
-    if (!force && Date.now() - checkedAt < PRICE_CHECK_INTERVAL_MS) return
+    const fresh = !current.stale && (current.sourceQuality === 'verified' || current.sourceQuality === 'observed') && Number.isFinite(checkedAt)
+    if (!force && fresh && Date.now() - checkedAt < PRICE_CHECK_INTERVAL_MS) return
 
     const now = new Date().toISOString()
     try {
@@ -345,6 +349,7 @@ export async function fetchStructuredPriceBook(
     book: {
       ...previousBook,
       schemaVersion: 2,
+      normalizationRevision: PRICING_NORMALIZATION_REVISION,
       sourceUrl: LITELLM_SOURCE_URL,
       sourceSha256,
       sourceEtag: rawResponse.etag,
@@ -369,6 +374,7 @@ export function createBundledPriceBook(now = new Date().toISOString()): StoredPr
   const models = createEmbeddedModels(now)
   return {
     schemaVersion: 2,
+    normalizationRevision: PRICING_NORMALIZATION_REVISION,
     sourceUrl: EMBEDDED_PROVENANCE.sourceUrl,
     checkedAt: null,
     updatedAt: now,
@@ -668,25 +674,25 @@ export function normalizeLiteLLMPriceBook(
     const model = normalizeModelId(rawModel)
     const rate = parseLiteLLMRate(rawValue)
     if (!rate) continue
-    const isLong = Math.max(numericValue(rawValue.max_input_tokens), numericValue(rawValue.max_tokens)) > Number(LONG_CONTEXT_THRESHOLD)
+    // LiteLLM max_* values describe capacity only. They are not evidence of
+    // a separate long-context rate component.
+    const explicitLong = parseExplicitLiteLLMLongRate(rawValue)
     const existing = models[model]
     const component = makeProvenance(provenance, `${provenance.source}-base-${model}`)
     if (!existing) {
       models[model] = {
-        short: isLong ? emptyPriceSet() : rate,
-        long: isLong ? rate : null,
-        longContextThreshold: isLong ? LONG_CONTEXT_THRESHOLD.toString() : null,
-        ...(isLong ? { longComponent: component } : { base: component })
+        short: rate,
+        long: explicitLong?.rate ?? null,
+        longContextThreshold: explicitLong?.threshold ?? null,
+        base: component,
+        ...(explicitLong ? { longComponent: makeProvenance(provenance, `${provenance.source}-long-${model}`) } : {})
       }
       continue
     }
-    if (isLong && !existing.long) {
-      existing.long = rate
-      existing.longContextThreshold = LONG_CONTEXT_THRESHOLD.toString()
-      existing.longComponent = component
-    } else if (!isLong && !existing.base) {
-      existing.short = rate
-      existing.base = component
+    if (explicitLong && !isCompleteLong(existing)) {
+      existing.long = explicitLong.rate
+      existing.longContextThreshold = explicitLong.threshold
+      existing.longComponent = makeProvenance(provenance, `${provenance.source}-long-${model}`)
     }
   }
   return models
@@ -738,19 +744,30 @@ export function mergePricingSources(input: {
   for (const [model, supplement] of Object.entries(input.longSupplement ?? {})) {
     const current = models[model]
     if (!current) continue
-    if (current.base && supplement.base && stableJson(current.short) !== stableJson(supplement.short)) {
-      conflicts.push({ model, component: 'base', left: stableJson(current.short), right: stableJson(supplement.short), detectedAt: now })
-    }
+    // The long supplement is intentionally not a base-price authority. A
+    // complete LiteLLM base remains canonical, so capacity-shaped duplicate
+    // rows cannot create a false base conflict.
     if (isCompleteLong(current) && isCompleteLong(supplement)) {
-      if (stableJson(current.long) !== stableJson(supplement.long)) {
+      const differs = stableJson(current.long) !== stableJson(supplement.long)
+      if (differs) {
         conflicts.push({ model, component: 'long', left: stableJson(current.long), right: stableJson(supplement.long), detectedAt: now })
+      }
+      // LiteLLM remains the authoritative complete long component. If the
+      // supplement is the explicit LiteLLM component, replace a non-LiteLLM
+      // candidate as one whole component after recording any conflict.
+      if (current.longComponent?.source !== 'litellm' && supplement.longComponent?.source === 'litellm') {
+        current.long = supplement.long ? { ...supplement.long } : null
+        current.longContextThreshold = supplement.longContextThreshold
+        current.longComponent = supplement.longComponent ? { ...supplement.longComponent } : undefined
       }
       continue
     }
-    if (!current.long && isCompleteLong(supplement)) {
-      current.long = supplement.long
+    if (!isCompleteLong(current) && isCompleteLong(supplement)) {
+      // Replace the entire long component atomically. Never retain a partial
+      // rate field from a source that could not prove the whole component.
+      current.long = supplement.long ? { ...supplement.long } : null
       current.longContextThreshold = supplement.longContextThreshold
-      current.longComponent = supplement.longComponent
+      current.longComponent = supplement.longComponent ? { ...supplement.longComponent } : undefined
     }
   }
 
@@ -871,9 +888,9 @@ function makeProvenance(provenance: Omit<PriceComponentProvenance, 'componentId'
 }
 
 function parseLiteLLMRate(record: Record<string, unknown>): StoredPriceSet | null {
-  const input = tokenUsdToMicro(record.input_cost_per_token)
-  const output = tokenUsdToMicro(record.output_cost_per_token)
-  const cached = tokenUsdToMicro(record.cache_read_input_token_cost ?? record.cached_input_cost_per_token)
+  const input = tokenUsdToMicro(record.input_cost_per_token ?? record.input)
+  const output = tokenUsdToMicro(record.output_cost_per_token ?? record.output)
+  const cached = tokenUsdToMicro(record.cache_read_input_token_cost ?? record.cached_input_cost_per_token ?? record.cache_read)
   if (input === null || output === null || cached === null) return null
   return {
     inputMicroUsdPerMillion: input,
@@ -881,6 +898,71 @@ function parseLiteLLMRate(record: Record<string, unknown>): StoredPriceSet | nul
     cacheWriteMicroUsdPerMillion: tokenUsdToMicro(record.cache_creation_input_token_cost ?? record.cache_write_input_token_cost),
     outputMicroUsdPerMillion: output
   }
+}
+
+interface ExplicitLiteLLMLongRate {
+  rate: StoredPriceSet
+  threshold: string
+}
+
+function parseExplicitLiteLLMLongRate(record: Record<string, unknown>): ExplicitLiteLLMLongRate | null {
+  // Keep this allowlist deliberately explicit: max_input_tokens/max_tokens
+  // are capacity fields and must not be interpreted as pricing components.
+  const nestedKeys = [
+    'long',
+    'long_context',
+    'longContext',
+    'long_context_pricing',
+    'longContextPricing',
+    'context_window_pricing'
+  ]
+  for (const key of nestedKeys) {
+    const nested = record[key]
+    if (!isRecord(nested)) continue
+    const rate = parseLiteLLMRate(nested)
+    if (!rate) continue
+    return { rate, threshold: parseLongThreshold(nested) }
+  }
+
+  const direct = {
+    input: firstDefined(record, ['input_cost_per_token_above_272k', 'input_cost_per_token_above_272K', 'long_context_input_cost_per_token', 'long_input_cost_per_token']) ?? firstMatching(record, /(?:^long(?:_context)?_input_cost_per_token$|^input_cost_per_token_(?:above|over)_\d+k$|^input_cost_per_token_(?:long|long_context)$)/iu),
+    cached: firstDefined(record, ['cache_read_input_token_cost_above_272k', 'cache_read_input_token_cost_above_272K', 'long_context_cache_read_input_token_cost', 'long_cache_read_input_token_cost']) ?? firstMatching(record, /(?:^long(?:_context)?_cache_read_input_token_cost$|^cache_read_input_token_cost_(?:above|over)_\d+k$|^cache_read_input_token_cost_(?:long|long_context)$)/iu),
+    cacheWrite: firstDefined(record, ['cache_creation_input_token_cost_above_272k', 'cache_creation_input_token_cost_above_272K', 'long_context_cache_creation_input_token_cost', 'long_cache_creation_input_token_cost']) ?? firstMatching(record, /(?:^long(?:_context)?_cache_(?:creation|write)_input_token_cost$|^cache_(?:creation|write)_input_token_cost_(?:above|over)_\d+k$|^cache_(?:creation|write)_input_token_cost_(?:long|long_context)$)/iu),
+    output: firstDefined(record, ['output_cost_per_token_above_272k', 'output_cost_per_token_above_272K', 'long_context_output_cost_per_token', 'long_output_cost_per_token']) ?? firstMatching(record, /(?:^long(?:_context)?_output_cost_per_token$|^output_cost_per_token_(?:above|over)_\d+k$|^output_cost_per_token_(?:long|long_context)$)/iu)
+  }
+  const input = tokenUsdToMicro(direct.input)
+  const cached = tokenUsdToMicro(direct.cached)
+  const output = tokenUsdToMicro(direct.output)
+  if (input === null || cached === null || output === null) return null
+  return {
+    rate: {
+      inputMicroUsdPerMillion: input,
+      cachedInputMicroUsdPerMillion: cached,
+      cacheWriteMicroUsdPerMillion: tokenUsdToMicro(direct.cacheWrite),
+      outputMicroUsdPerMillion: output
+    },
+    threshold: parseLongThreshold(record)
+  }
+}
+
+function firstDefined(record: Record<string, unknown>, keys: string[]): unknown {
+  for (const key of keys) if (record[key] !== undefined && record[key] !== null) return record[key]
+  return undefined
+}
+
+function firstMatching(record: Record<string, unknown>, pattern: RegExp): unknown {
+  const key = Object.keys(record).find((candidate) => pattern.test(candidate))
+  return key ? record[key] : undefined
+}
+
+function parseLongThreshold(record: Record<string, unknown>): string {
+  for (const key of Object.keys(record)) {
+    const match = key.match(/_(?:above|over)_(\d+)k$/iu)
+    if (match) return (BigInt(match[1]!) * 1_000n).toString()
+  }
+  const candidate = record.long_context_threshold ?? record.longContextThreshold ?? record.long_context_pricing_threshold ?? record.longContextPricingThreshold ?? record.threshold
+  const numeric = numericValue(candidate)
+  return Number.isFinite(numeric) && numeric > 0 ? Math.trunc(numeric).toString() : LONG_CONTEXT_THRESHOLD.toString()
 }
 
 function parseModelsDevRate(record: Record<string, unknown>): StoredPriceSet | null {
@@ -1117,7 +1199,17 @@ function parseLatestCommitMetadata(value: unknown): { sha: string; date: string 
 
 function ensurePriceBook(book: StoredPriceBook): StoredPriceBook {
   const embedded = createBundledPriceBook(book.updatedAt || new Date().toISOString())
-  return { ...embedded, ...book, models: book.models ?? embedded.models, conflicts: book.conflicts ?? [], fastFacts: book.fastFacts ?? embedded.fastFacts, lastError: book.lastError ?? null }
+  const candidate = { ...embedded, ...book, models: book.models ?? embedded.models, conflicts: book.conflicts ?? [], fastFacts: book.fastFacts ?? embedded.fastFacts, lastError: book.lastError ?? null }
+  if (!isValidPriceBook(candidate)) {
+    return {
+      ...embedded,
+      updatedAt: book.updatedAt || embedded.updatedAt,
+      stale: true,
+      message: 'Stored pricing required normalization; using the pinned bundle until refresh succeeds.',
+      lastError: null
+    }
+  }
+  return candidate
 }
 
 function cloneModelPrice(value: StoredModelPrice): StoredModelPrice {
@@ -1139,7 +1231,11 @@ function mergeModels(left: Record<string, StoredModelPrice>, right: Record<strin
 }
 
 function isCompletePriceSet(value: StoredPriceSet | null): value is StoredPriceSet {
-  return value !== null && value.inputMicroUsdPerMillion !== '' && value.cachedInputMicroUsdPerMillion !== '' && value.outputMicroUsdPerMillion !== ''
+  return value !== null &&
+    /^\d+$/u.test(value.inputMicroUsdPerMillion) &&
+    /^\d+$/u.test(value.cachedInputMicroUsdPerMillion) &&
+    /^\d+$/u.test(value.outputMicroUsdPerMillion) &&
+    (value.cacheWriteMicroUsdPerMillion === null || /^\d+$/u.test(value.cacheWriteMicroUsdPerMillion))
 }
 
 function isCompleteLong(value: StoredModelPrice): boolean {
@@ -1150,8 +1246,20 @@ function isCompleteModel(value: StoredModelPrice): boolean {
   return isCompletePriceSet(value.short) && Boolean(value.base)
 }
 
+function isValidPriceBook(value: StoredPriceBook): boolean {
+  if (value.schemaVersion !== 2 || value.normalizationRevision !== PRICING_NORMALIZATION_REVISION) return false
+  if (!['verified', 'observed', 'embedded'].includes(value.sourceQuality ?? '')) return false
+  if (!isRecord(value.models) || Object.keys(value.models).length === 0) return false
+  for (const model of Object.values(value.models)) {
+    if (!isRecord(model) || !isCompletePriceSet(model.short) || !hasPositiveRate(model.short) || !('long' in model)) return false
+    if (model.long !== null && !isCompletePriceSet(model.long)) return false
+  }
+  if (value.payloadSha256 && value.payloadSha256 !== canonicalPricingHash(value.models)) return false
+  return true
+}
+
 function hasEffectiveBase(value: StoredModelPrice): boolean {
-  if (value.base) return isCompletePriceSet(value.short)
+  if (value.base) return isCompletePriceSet(value.short) && hasPositiveRate(value.short)
   // v1 markdown fixtures have no component metadata. A non-zero short set is
   // still an effective legacy price; the all-zero placeholder used for a
   // long-only LiteLLM row is deliberately unpriced.
@@ -1160,6 +1268,11 @@ function hasEffectiveBase(value: StoredModelPrice): boolean {
     value.short.cachedInputMicroUsdPerMillion,
     value.short.outputMicroUsdPerMillion
   ].some((rate) => /^\d+$/.test(rate) && BigInt(rate) > 0n)
+}
+
+function hasPositiveRate(value: StoredPriceSet): boolean {
+  return [value.inputMicroUsdPerMillion, value.cachedInputMicroUsdPerMillion, value.cacheWriteMicroUsdPerMillion, value.outputMicroUsdPerMillion]
+    .some((rate) => rate !== null && /^\d+$/u.test(rate) && BigInt(rate) > 0n)
 }
 
 function isRecognizedModel(model: string): boolean {
@@ -1340,6 +1453,7 @@ const MODEL_ALIASES: Record<string, string> = {
 
 export const pricingConstants = {
   PRICING_URL: OFFICIAL_PRICING_URL,
+  PRICING_NORMALIZATION_REVISION,
   LITELLM_COMMIT_API,
   LITELLM_RAW_PREFIX,
   MODELS_DEV_URL,
