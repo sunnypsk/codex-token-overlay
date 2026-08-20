@@ -6,6 +6,7 @@ import { buildDashboardSnapshot, type SnapshotRuntimeStatus } from './aggregatio
 import { AppServerClient } from './app-server-client.js'
 import { findCodexExecutable } from './codex-executable.js'
 import { PricingService } from './pricing.js'
+import { PricingDiagnostics } from './pricing-diagnostics.js'
 import { SessionIndexer, type IndexerProgress } from './session-indexer.js'
 import { StateStore } from './state.js'
 import { startOfHongKongMonth } from './time.js'
@@ -13,12 +14,14 @@ import { startOfHongKongMonth } from './time.js'
 const RATE_LIMIT_POLL_MS = 60_000
 const ACCOUNT_USAGE_POLL_MS = 15 * 60_000
 const DEFAULT_BACKFILL_MS = 63 * 24 * 60 * 60 * 1_000
+const DIAGNOSTICS_FLUSH_TIMEOUT_MS = 2_000
 
 export class UsageService extends EventEmitter {
   readonly store: StateStore
   private appServer: AppServerClient | null = null
   private indexer: SessionIndexer | null = null
   private pricing: PricingService
+  private readonly diagnostics: PricingDiagnostics
   private rateTimer: NodeJS.Timeout | null = null
   private usageTimer: NodeJS.Timeout | null = null
   private reconnectTimer: NodeJS.Timeout | null = null
@@ -34,9 +37,15 @@ export class UsageService extends EventEmitter {
     totalFiles: 0
   }
 
-  constructor(userDataPath: string) {
+  constructor(
+    userDataPath: string,
+    logsPath = join(userDataPath, 'logs'),
+    diagnostics: PricingDiagnostics = new PricingDiagnostics(logsPath),
+    private readonly diagnosticsFlushTimeoutMs = DIAGNOSTICS_FLUSH_TIMEOUT_MS
+  ) {
     super()
     this.store = new StateStore(join(userDataPath, 'usage-state.json'))
+    this.diagnostics = diagnostics
     this.pricing = new PricingService(
       () => this.store.get().priceBook,
       (priceBook) => this.store.update((state) => {
@@ -56,6 +65,7 @@ export class UsageService extends EventEmitter {
       }),
       () => {
         this.emitSnapshot()
+        void this.diagnostics.emit(this.store.get())
         // A semantic pricing change invalidates unknown-context sessions;
         // scanning here converges the projection without waiting for the
         // periodic index interval. Startup creates the indexer after the
@@ -71,6 +81,7 @@ export class UsageService extends EventEmitter {
     await this.store.load()
     this.stopped = false
     await this.pricing.refreshIfDue()
+    void this.diagnostics.emit(this.store.get())
     this.pricing.start(false)
     this.rateTimer = setInterval(() => void this.syncRateLimits(), RATE_LIMIT_POLL_MS)
     this.usageTimer = setInterval(() => void this.syncAccountUsage(), ACCOUNT_USAGE_POLL_MS)
@@ -92,6 +103,7 @@ export class UsageService extends EventEmitter {
     this.indexer = null
     await this.appServer?.stop()
     this.appServer = null
+    await flushDiagnosticsWithTimeout(this.diagnostics, this.diagnosticsFlushTimeoutMs)
     await this.store.save()
   }
 
@@ -101,6 +113,10 @@ export class UsageService extends EventEmitter {
       this.runtime,
       this.indexer?.getFallbackRateLimit() ?? null
     )
+  }
+
+  getPricingDiagnosticsPath(): string {
+    return this.diagnostics.filePath
   }
 
   async refresh(): Promise<DashboardSnapshot> {
@@ -222,6 +238,7 @@ export class UsageService extends EventEmitter {
       this.runtime.totalFiles = progress.totalFiles
       if (progress.message) this.runtime.appServerMessage ??= progress.message
       this.emitSnapshot()
+      void this.diagnostics.emit(this.store.get())
     }
     this.indexer = new SessionIndexer(codexHome, this.store, scanStartMs, onChanged)
     void this.indexer.start()
@@ -269,5 +286,16 @@ function defaultCodexHome(): string {
 export const usageServiceConstants = {
   RATE_LIMIT_POLL_MS,
   ACCOUNT_USAGE_POLL_MS,
-  DEFAULT_BACKFILL_MS
+  DEFAULT_BACKFILL_MS,
+  DIAGNOSTICS_FLUSH_TIMEOUT_MS
+}
+
+async function flushDiagnosticsWithTimeout(diagnostics: PricingDiagnostics, timeoutMs: number): Promise<void> {
+  const flush = Promise.resolve().then(() => diagnostics.flush()).catch(() => undefined)
+  let timeoutHandle: NodeJS.Timeout | null = null
+  const timeout = new Promise<void>((resolve) => {
+    timeoutHandle = setTimeout(resolve, Math.max(0, timeoutMs))
+  })
+  await Promise.race([flush, timeout])
+  if (timeoutHandle) clearTimeout(timeoutHandle)
 }

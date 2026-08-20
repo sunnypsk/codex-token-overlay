@@ -96,16 +96,32 @@ export interface ContextUsage {
 
 export interface EffectivePricingLedgerSnapshot {
   effectiveAt: string
+  /** Optional observation timestamp used to order same-effective revisions. */
+  observedAt?: string | null
   models: Record<string, unknown>
+}
+
+interface EffectiveLedgerCandidate {
+  entry: EffectivePricingLedgerSnapshot
+  effectiveMs: number
+  observedMs: number
+  appendPosition: number
 }
 
 export interface EffectiveModelPricing {
   modelId: string
+  /** Canonical exact/alias target selected for this event, when priceable. */
+  resolvedKey?: string
   price: StoredModelPrice | undefined
   longContextThreshold: bigint | null
   hasEffectiveBase: boolean
   hasEffectiveLong: boolean
   fastFact?: FastPriceFact | null
+}
+
+export interface ResolvedCanonicalModelPrice {
+  key: string
+  price: StoredModelPrice
 }
 
 export interface ValidatedFastRational {
@@ -599,12 +615,41 @@ export function normalizeModelId(model: string): string {
   return model.trim().replace(/^openai[/:]/iu, '').toLowerCase()
 }
 
+function resolveModelEntry(book: StoredPriceBook, model: string, exactOnly = false): ResolvedCanonicalModelPrice | undefined {
+  const normalized = normalizeModelId(model)
+  const exact = book.models[model] ?? book.models[normalized]
+  if (exact) {
+    const key = book.models[model] ? model : normalized
+    return { key, price: exact }
+  }
+  if (exactOnly) return undefined
+  const alias = MODEL_ALIASES[normalized]
+  return alias && book.models[alias] ? { key: alias, price: book.models[alias] } : undefined
+}
+
+function hasCanonicalBaseProvenance(model: string, price: StoredModelPrice): boolean {
+  const base = price.base
+  // Markdown/v1 books can be valid without component provenance. If metadata
+  // exists, it must be a recognized source and identify the resolved target.
+  if (!base) return true
+  if (!isCanonicalPricingSource(base.source)) return false
+  return base.componentId === `${base.source}-base-${normalizeModelId(model)}`
+}
+
+function isCanonicalPricingSource(value: unknown): value is PricingSource {
+  return value === 'litellm' || value === 'models.dev' || value === 'live-models.dev' || value === 'embedded'
+}
+
 export function resolveModelPrice(book: StoredPriceBook, model: string, options: { exactOnly?: boolean } = {}): StoredModelPrice | undefined {
-  const exact = book.models[model] ?? book.models[normalizeModelId(model)]
-  if (exact) return exact
-  if (options.exactOnly) return undefined
-  const alias = MODEL_ALIASES[normalizeModelId(model)]
-  return alias ? book.models[alias] : undefined
+  return resolveModelEntry(book, model, options.exactOnly)?.price
+}
+
+/** Resolve a recognized exact/normalized/alias model with canonical provenance. */
+export function resolveCanonicalModelPrice(book: StoredPriceBook, model: string): ResolvedCanonicalModelPrice | undefined {
+  if (!isRecognizedModel(model)) return undefined
+  const resolved = resolveModelEntry(book, model)
+  if (!resolved || !isRecognizedModel(resolved.key) || !hasCanonicalBaseProvenance(resolved.key, resolved.price)) return undefined
+  return resolved
 }
 
 /** Resolve one model revision at an event timestamp, including aliases. */
@@ -614,26 +659,28 @@ export function resolveEffectiveModelPricing(
   eventAt: string | number,
   ledger: EffectivePricingLedgerSnapshot[] = []
 ): EffectiveModelPricing {
-  const eventMs = typeof eventAt === 'number' ? eventAt : Date.parse(eventAt)
+  const eventMs = typeof eventAt === 'number' ? eventAt : parseTimestamp(eventAt)
   const modelId = normalizeModelId(model)
   if (!Number.isFinite(eventMs)) return { modelId, price: undefined, longContextThreshold: null, hasEffectiveBase: false, hasEffectiveLong: false, fastFact: null }
-  const validLedger = ledger.filter((entry) => {
-    if (!entry || !isRecord(entry.models)) return false
-    const effectiveMs = Date.parse(entry.effectiveAt)
-    return Number.isFinite(effectiveMs)
+  const validLedger = ledger.flatMap((entry, appendPosition) => {
+    if (!entry || !isRecord(entry.models)) return []
+    const effectiveMs = parseTimestamp(entry.effectiveAt)
+    if (!Number.isFinite(effectiveMs)) return []
+    const observedMs = parseTimestamp(entry.observedAt)
+    return [{ entry, effectiveMs, observedMs, appendPosition }]
   })
-  const ordered = [...validLedger]
-    .filter((entry) => Date.parse(entry.effectiveAt) <= eventMs)
-    .sort((left, right) => Date.parse(right.effectiveAt) - Date.parse(left.effectiveAt))
-  const revision = ordered[0]
+  const revision = validLedger
+    .filter((candidate) => candidate.effectiveMs <= eventMs)
+    .sort(compareLedgerCandidates)[0]?.entry
   if (ledger.length > 0 && !revision) return { modelId, price: undefined, longContextThreshold: null, hasEffectiveBase: false, hasEffectiveLong: false, fastFact: null }
   const modelBook = revision
     ? { ...book, models: revision.models as Record<string, StoredModelPrice> }
     : book
-  const price = resolveModelPrice(modelBook, model, { exactOnly: false })
+  const resolved = resolveCanonicalModelPrice(modelBook, model)
+  const price = resolved?.price
   const baseEffectiveMs = price?.base?.effectiveAt ? Date.parse(price.base.effectiveAt) : Number.NaN
   if (!price || !price.base?.effectiveAt || !Number.isFinite(baseEffectiveMs) || baseEffectiveMs > eventMs || !hasEffectiveBase(price)) {
-    return { modelId, price: undefined, longContextThreshold: null, hasEffectiveBase: false, hasEffectiveLong: false, fastFact: null }
+    return { modelId, resolvedKey: resolved?.key, price: undefined, longContextThreshold: null, hasEffectiveBase: false, hasEffectiveLong: false, fastFact: null }
   }
   const longEffectiveMs = price.longComponent?.effectiveAt ? Date.parse(price.longComponent.effectiveAt) : Number.NaN
   const hasEffectiveLong = isCompleteLong(price) && Boolean(price.longComponent?.effectiveAt) && Number.isFinite(longEffectiveMs) && longEffectiveMs <= eventMs
@@ -641,7 +688,29 @@ export function resolveEffectiveModelPricing(
     ? BigInt(price.longContextThreshold)
     : null
   const fastFact = fastFactForModel(modelId, modelBook, eventMs)
-  return { modelId, price, longContextThreshold: threshold, hasEffectiveBase: true, hasEffectiveLong, fastFact }
+  return { modelId, resolvedKey: resolved?.key, price, longContextThreshold: threshold, hasEffectiveBase: true, hasEffectiveLong, fastFact }
+}
+
+function parseTimestamp(value: unknown): number {
+  return typeof value === 'string' ? Date.parse(value) : Number.NaN
+}
+
+function compareLedgerCandidates(left: EffectiveLedgerCandidate, right: EffectiveLedgerCandidate): number {
+  const effectiveOrder = right.effectiveMs - left.effectiveMs
+  if (effectiveOrder !== 0) return effectiveOrder
+
+  const leftObserved = Number.isFinite(left.observedMs)
+  const rightObserved = Number.isFinite(right.observedMs)
+  if (leftObserved !== rightObserved) return leftObserved ? -1 : 1
+  if (leftObserved && rightObserved) {
+    const observedOrder = right.observedMs - left.observedMs
+    if (observedOrder !== 0) return observedOrder
+  }
+
+  // Array order is the append order of the durable ledger. It is the final
+  // deterministic tie-break when observation metadata cannot distinguish
+  // revisions (or is equal).
+  return right.appendPosition - left.appendPosition
 }
 
 export function canonicalPricingHash(models: Record<string, StoredModelPrice>): string {
@@ -1470,6 +1539,7 @@ export const pricingInternals = {
   parseLatestCommitMetadata,
   parseRetryAfter,
   isRecognizedModel,
+  resolveCanonicalModelPrice,
   hasEffectiveBase,
   readResponseTextLimited,
   stableJson,

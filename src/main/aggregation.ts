@@ -12,11 +12,11 @@ import type {
 } from '../shared/contracts.js'
 import {
   calculateModelCostDetailed,
-  fastFactForModel,
-  normalizeModelId,
+  resolveEffectiveModelPricing,
   resolveModelPrice,
   roundAttoUsdToMicroUsd,
   type ContextUsage,
+  type StoredModelPrice,
   type StoredPriceBook
 } from './pricing.js'
 import type {
@@ -57,6 +57,12 @@ interface ModelAggregateSlice extends ContextUsage {
   firstEventAt?: string
   lastEventAt?: string
   bySpeed?: Partial<Record<ServiceTier, { short: BigTokenBreakdown; long: BigTokenBreakdown; unknown?: BigTokenBreakdown; eventCount: number; firstEventAt?: string; lastEventAt?: string }>>
+}
+
+interface PricingSegment {
+  model: string
+  usage: ModelAggregateSlice
+  legacy: boolean
 }
 
 type ModelsBig = Record<string, ModelAggregateBig>
@@ -129,7 +135,9 @@ export function buildPeriod(
   state: PersistentState
 ): PeriodSummary {
   const dateKeys = dateKeysBetween(startMs, endMs)
-  const models = aggregateDailyModels(state, new Set(dateKeys))
+  const dateSet = new Set(dateKeys)
+  const models = aggregateDailyModels(state, dateSet)
+  const pricingSegments = collectPricingSegments(state, dateSet)
   const localTokens = sumModels(models)
   const today = hongKongDateKey(endMs)
   let authoritativeTokens = 0n
@@ -154,7 +162,7 @@ export function buildPeriod(
   }
 
   const source = usedAccount && usedLocal ? 'mixed' : usedAccount ? 'account' : 'local'
-  const { cost, modelSummaries } = calculateCostSummary(models, usedAccount ? accountTokens : null, state.priceBook)
+  const { cost, modelSummaries } = calculateCostSummary(models, usedAccount ? accountTokens : null, state.priceBook, state.pricingLedger, pricingSegments)
 
   return {
     key,
@@ -339,6 +347,38 @@ function aggregateDailyModels(state: PersistentState, dates: Set<string>): Model
   return models
 }
 
+function collectPricingSegments(state: PersistentState, dates: Set<string>): PricingSegment[] {
+  const segments: PricingSegment[] = []
+  for (const session of Object.values(state.sessions)) {
+    for (const [date, daily] of Object.entries(session.legacyDaily ?? {})) {
+      if (!dates.has(date)) continue
+      for (const [model, stored] of Object.entries(daily.models)) {
+        segments.push({ model, usage: materializeStoredModel(stored), legacy: true })
+      }
+    }
+    for (const [date, daily] of Object.entries(session.daily)) {
+      if (!dates.has(date)) continue
+      const legacy = session.legacyUnpriced === true && !session.legacyDaily
+      for (const [model, stored] of Object.entries(daily.models)) {
+        segments.push({ model, usage: materializeStoredModel(stored), legacy })
+      }
+    }
+  }
+  return segments
+}
+
+function materializeStoredModel(stored: StoredModelAggregate): ModelAggregateSlice {
+  const aggregate: ModelAggregateSlice = {
+    short: zeroTokens(),
+    long: zeroTokens(),
+    unknown: zeroTokens(),
+    eventCount: 0,
+    bySpeed: {}
+  }
+  mergeAggregateSlice(aggregate, stored)
+  return aggregate
+}
+
 function aggregateCycles(state: PersistentState): AggregatedCycle[] {
   const cycles = new Map<string, AggregatedCycle>()
   for (const session of Object.values(state.sessions)) {
@@ -437,7 +477,9 @@ function sumModels(models: ModelsBig): BigTokenBreakdown {
 function calculateCostSummary(
   models: ModelsBig,
   authoritativeAccountTokens: bigint | null,
-  priceBook: StoredPriceBook
+  priceBook: StoredPriceBook,
+  pricingLedger: PersistentState['pricingLedger'] = [],
+  pricingSegments: PricingSegment[] = []
 ): {
   cost: PeriodSummary['cost']
   modelSummaries: ModelUsageSummary[]
@@ -455,6 +497,12 @@ function calculateCostSummary(
     unknown: { shortTokens: 0n, longTokens: 0n, unknownTokens: 0n, pricedTokens: 0n, unpricedTokens: 0n, premiumVerifiedTokens: 0n, lowerBound: false }
   }
   const modelSummaries: ModelUsageSummary[] = []
+  const segmentsByModel = new Map<string, PricingSegment[]>()
+  for (const segment of pricingSegments) {
+    const modelSegments = segmentsByModel.get(segment.model) ?? []
+    modelSegments.push(segment)
+    segmentsByModel.set(segment.model, modelSegments)
+  }
 
   for (const [model, usage] of Object.entries(models)) {
     const combined = addTokens(addTokens(usage.short, usage.long), usage.unknown ?? zeroTokens())
@@ -462,19 +510,21 @@ function calculateCostSummary(
       ? addTokens(combined, addTokens(addTokens(usage.legacy.short, usage.legacy.long), usage.legacy.unknown ?? zeroTokens()))
       : combined
     localTokens += totalWithLegacy.total
-    const segments: Array<{ usage: ModelAggregateSlice; legacy: boolean }> = [
-      { usage, legacy: false },
-      ...(usage.legacy ? [{ usage: usage.legacy, legacy: true }] : [])
-    ]
     let modelAtto = 0n
     let modelPriced = 0n
     let modelUnpriced = 0n
     let modelLowerBound = false
+    const summaryBaseIdentities = new Set<string>()
+    let summaryIdentityComplete = true
     let summaryPrice: ReturnType<typeof resolveModelPrice> | undefined
+    const segments = segmentsByModel.get(model)?.length
+      ? segmentsByModel.get(model)!
+      : [
+          { model, usage, legacy: false },
+          ...(usage.legacy ? [{ model, usage: usage.legacy, legacy: true }] : [])
+        ]
     for (const segment of segments) {
       const segmentUsage = segment.usage
-      const price = segment.legacy ? undefined : resolveModelPrice(priceBook, model, { exactOnly: false })
-      if (price) summaryPrice = price
       const bySpeed = segmentUsage.bySpeed && Object.keys(segmentUsage.bySpeed).length > 0
         ? segmentUsage.bySpeed
         : { standard: { short: segmentUsage.short, long: segmentUsage.long, unknown: segmentUsage.unknown, eventCount: segmentUsage.eventCount } }
@@ -483,14 +533,21 @@ function calculateCostSummary(
         if (!speedUsage) continue
         const speedUnknown = speedUsage.unknown ?? zeroTokens()
         const speedTokens = addTokens(addTokens(speedUsage.short, speedUsage.long), speedUnknown)
-        const fastFact = !segment.legacy && speed === 'fast' && speedUsage.firstEventAt
-          ? fastFactForModel(model, priceBook, speedUsage.firstEventAt)
+        const eventAt = speedUsage.firstEventAt ?? segmentUsage.firstEventAt ?? priceBook.updatedAt
+        const effective = segment.legacy
+          ? null
+          : resolveEffectiveModelPricing(priceBook, model, eventAt, pricingLedger)
+        const selectedPrice = effective?.hasEffectiveBase ? effective.price : undefined
+        const baseIdentity = selectedPrice ? pricingBaseIdentity(selectedPrice) : null
+        // A valid base can coexist with an ineligible long revision. Keep the
+        // selected base for short pricing, but project long to null for this
+        // calculation so a future/malformed long rate cannot leak through.
+        const effectivePrice = selectedPrice && effective?.hasEffectiveLong === false
+          ? { ...selectedPrice, long: null, longContextThreshold: null }
+          : selectedPrice
+        const fastFact = !segment.legacy && speed === 'fast'
+          ? effective?.fastFact ?? null
           : null
-        const baseEffective = price?.base?.effectiveAt
-        const longEffective = price?.longComponent?.effectiveAt
-        const beforeBase = Boolean(baseEffective && speedUsage.firstEventAt && speedUsage.firstEventAt < baseEffective)
-        const beforeLong = Boolean(longEffective && speedUsage.long.total > 0n && speedUsage.firstEventAt && speedUsage.firstEventAt < longEffective)
-        const effectivePrice = segment.legacy || beforeBase || beforeLong ? undefined : price
         const result = calculateModelCostDetailed(
           { short: speedUsage.short, long: speedUsage.long },
           effectivePrice,
@@ -499,7 +556,14 @@ function calculateCostSummary(
         const isUnknownSpeed = speed === 'unknown'
         const unknownContextTokens = speedUnknown.total
         const speedUnpricedTokens = (result.unpricedTokens ?? 0n) + unknownContextTokens
-        const speedLowerBound = result.lowerBound === true || isUnknownSpeed || unknownContextTokens > 0n || segment.legacy
+        const missingBase = !segment.legacy && !effective?.hasEffectiveBase
+        const missingLong = !segment.legacy && speedUsage.long.total > 0n && !effective?.hasEffectiveLong
+        const speedLowerBound = result.lowerBound === true || isUnknownSpeed || unknownContextTokens > 0n || segment.legacy || missingBase || missingLong
+        if (result.pricedTokens > 0n && selectedPrice) {
+          summaryPrice ??= selectedPrice
+          if (baseIdentity) summaryBaseIdentities.add(baseIdentity)
+          else summaryIdentityComplete = false
+        }
         const tier = tierTotals[speed]
         tier.shortTokens += speedUsage.short.total
         tier.longTokens += speedUsage.long.total
@@ -527,7 +591,7 @@ function calculateCostSummary(
       pricedTokens: modelPriced.toString(),
       unpricedTokens: modelUnpriced.toString(),
       lowerBound: modelLowerBound,
-      source: summaryPrice?.base
+      source: summaryIdentityComplete && summaryBaseIdentities.size === 1 && summaryPrice?.base
         ? {
             componentId: summaryPrice.base.componentId,
             source: summaryPrice.base.source,
@@ -577,6 +641,26 @@ function calculateCostSummary(
     },
     modelSummaries
   }
+}
+
+function pricingBaseIdentity(price: StoredModelPrice): string | null {
+  const base = price.base
+  if (!base) return null
+  return JSON.stringify({
+    componentId: base.componentId ?? null,
+    source: base.source ?? null,
+    sourceUrl: base.sourceUrl ?? null,
+    sourceSha256: base.sourceSha256 ?? null,
+    sourceCommit: base.sourceCommit ?? null,
+    effectiveAt: base.effectiveAt ?? null,
+    quality: base.quality ?? null,
+    short: {
+      inputMicroUsdPerMillion: price.short.inputMicroUsdPerMillion ?? null,
+      cachedInputMicroUsdPerMillion: price.short.cachedInputMicroUsdPerMillion ?? null,
+      cacheWriteMicroUsdPerMillion: price.short.cacheWriteMicroUsdPerMillion ?? null,
+      outputMicroUsdPerMillion: price.short.outputMicroUsdPerMillion ?? null
+    }
+  })
 }
 
 function removeTukeyOutliers(sorted: bigint[]): bigint[] {
@@ -680,5 +764,6 @@ export const aggregationInternals = {
   aggregateCycles,
   sumModels,
   calculateCostSummary,
+  pricingBaseIdentity,
   percent
 }

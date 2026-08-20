@@ -27,7 +27,8 @@ import {
   type StoredSessionState,
   type ServiceTier,
   type ContextClass,
-  STATE_INDEX_REVISION
+  STATE_INDEX_REVISION,
+  ATTRIBUTION_REVISION
 } from './state.js'
 
 export interface IndexerProgress {
@@ -193,7 +194,13 @@ export class SessionIndexer {
         state.rebuild.message = complete
           ? null
           : `Rebuild incomplete: ${pending} pending file(s), ${unreconciled} unreconciled session(s).`
-        if (complete) state.indexRevision = STATE_INDEX_REVISION
+        // The projection revision is a durable migration marker, not a
+        // promise that every raw file exists. Mark it after one convergence
+        // pass so a permanently missing raw file does not enqueue the same
+        // full rebuild on every restart. Pending queue entries and the
+        // partial rebuild status still make retryable work visible.
+        state.indexRevision = STATE_INDEX_REVISION
+        state.attributionRevision = ATTRIBUTION_REVISION
       })
       await this.store.save()
       this.setProgress({
@@ -554,13 +561,12 @@ export class SessionIndexer {
     const isTokenCount = payloadType === 'token_count'
 
     if (isTurnContext) {
-      if (typeof payload.model === 'string') session.currentModel = payload.model
+      applyAttribution(session, payload)
       return
     }
 
     if (isSettings) {
-      const tier = extractServiceTier(payload)
-      if (tier) session.currentServiceTier = tier
+      applyAttribution(session, payload)
       return
     }
 
@@ -580,8 +586,9 @@ export class SessionIndexer {
       return
     }
 
-    const model = extractEventModel(payload, info) ?? (session.currentModel || 'unknown')
-    const eventTier = extractServiceTier(payload) ?? session.currentServiceTier ?? 'unknown'
+    const attribution = applyAttribution(session, payload, info)
+    const model = attribution.model
+    const eventTier = attribution.serviceTier
     const eventAt = new Date(timestampMs).toISOString()
     const effectivePricing = resolveEffectiveModelPricing(
       this.store.get().priceBook,
@@ -589,8 +596,7 @@ export class SessionIndexer {
       eventAt,
       this.store.get().pricingLedger
     )
-    const lastUsage = fromUnknownTokenUsage(info.last_token_usage)
-    const contextInput = lastUsage?.input ?? delta.input
+    const contextInput = extractRequestInput(payload, info, delta)
     const contextClass: ContextClass = effectivePricing.longContextThreshold === null
       ? 'unknown'
       : contextInput > effectivePricing.longContextThreshold
@@ -943,28 +949,126 @@ function addToStoredModel(
   if (delta.total > 0n) aggregate.eventCount += 1
 }
 
+interface EventAttribution {
+  model: string | null
+  modelPresent: boolean
+  serviceTier: ServiceTier
+  serviceTierPresent: boolean
+}
+
+type AttributionState = Pick<StoredSessionState, 'currentModel' | 'currentServiceTier'>
+
+interface PresentValue {
+  present: boolean
+  value: unknown
+}
+
+function firstPresent(...candidates: PresentValue[]): PresentValue {
+  return candidates.find((candidate) => candidate.present) ?? { present: false, value: undefined }
+}
+
+function property(value: Record<string, unknown>, key: string): PresentValue {
+  return { present: Object.prototype.hasOwnProperty.call(value, key), value: value[key] }
+}
+
 function extractServiceTier(value: Record<string, unknown>): ServiceTier | null {
-  const candidates: unknown[] = [
-    value.service_tier,
-    value.serviceTier,
-    isRecord(value.settings) ? value.settings.service_tier : undefined,
-    isRecord(value.settings) ? value.settings.serviceTier : undefined,
-    isRecord(value.info) ? value.info.service_tier : undefined
-  ]
-  const present = candidates.find((candidate) => candidate !== undefined)
-  if (present === undefined) return null
-  if (typeof present !== 'string') return 'unknown'
-  const normalized = present.trim().toLowerCase()
+  const settings = isRecord(value.settings) ? value.settings : null
+  const info = isRecord(value.info) ? value.info : null
+  const candidate = firstPresent(
+    property(value, 'service_tier'),
+    property(value, 'serviceTier'),
+    ...(settings ? [property(settings, 'service_tier'), property(settings, 'serviceTier')] : []),
+    ...(info ? [property(info, 'service_tier'), property(info, 'serviceTier')] : [])
+  )
+  if (!candidate.present) return null
+  if (typeof candidate.value !== 'string') return 'unknown'
+  const normalized = candidate.value.trim().toLowerCase()
   if (normalized === 'default' || normalized === 'standard') return 'standard'
   if (normalized === 'priority' || normalized === 'fast') return 'fast'
   return 'unknown'
 }
 
-function extractEventModel(payload: Record<string, unknown>, info: Record<string, unknown>): string | null {
-  for (const value of [payload.model, payload.model_name, info.model, info.model_name]) {
-    if (typeof value === 'string' && value.trim()) return value.trim()
+function extractModelPresence(value: Record<string, unknown>, info?: Record<string, unknown>): PresentValue {
+  const settings = isRecord(value.settings) ? value.settings : null
+  const eventInfo = info ?? (isRecord(value.info) ? value.info : null)
+  return firstPresent(
+    property(value, 'model'),
+    property(value, 'model_name'),
+    ...(settings ? [property(settings, 'model'), property(settings, 'model_name')] : []),
+    ...(eventInfo ? [property(eventInfo, 'model'), property(eventInfo, 'model_name')] : [])
+  )
+}
+
+function extractAttribution(payload: Record<string, unknown>, info?: Record<string, unknown>): EventAttribution {
+  const modelCandidate = extractModelPresence(payload, info)
+  const tierCandidate = firstPresent(
+    property(payload, 'service_tier'),
+    property(payload, 'serviceTier'),
+    ...(isRecord(payload.settings) ? [property(payload.settings, 'service_tier'), property(payload.settings, 'serviceTier')] : []),
+    ...(info ? [property(info, 'service_tier'), property(info, 'serviceTier')] : []),
+    ...(isRecord(payload.info) ? [property(payload.info, 'service_tier'), property(payload.info, 'serviceTier')] : [])
+  )
+  const model = modelCandidate.present && typeof modelCandidate.value === 'string' && modelCandidate.value.trim()
+    ? modelCandidate.value.trim()
+    : modelCandidate.present
+      ? 'unknown'
+      : null
+  let serviceTier: ServiceTier = 'unknown'
+  if (tierCandidate.present) {
+    if (typeof tierCandidate.value === 'string') {
+      const normalized = tierCandidate.value.trim().toLowerCase()
+      serviceTier = normalized === 'default' || normalized === 'standard'
+        ? 'standard'
+        : normalized === 'priority' || normalized === 'fast'
+          ? 'fast'
+          : 'unknown'
+    }
   }
-  return null
+  return {
+    model,
+    modelPresent: modelCandidate.present,
+    serviceTier,
+    serviceTierPresent: tierCandidate.present
+  }
+}
+
+function applyAttribution(
+  session: AttributionState,
+  payload: Record<string, unknown>,
+  info?: Record<string, unknown>
+): { model: string; serviceTier: ServiceTier } {
+  const attribution = extractAttribution(payload, info)
+  if (attribution.modelPresent) session.currentModel = attribution.model ?? 'unknown'
+  if (attribution.serviceTierPresent) session.currentServiceTier = attribution.serviceTier
+  return {
+    model: session.currentModel || 'unknown',
+    serviceTier: session.currentServiceTier ?? 'unknown'
+  }
+}
+
+function extractEventModel(payload: Record<string, unknown>, info: Record<string, unknown>): string | null {
+  const model = extractAttribution(payload, info)
+  return model.modelPresent && model.model !== 'unknown' ? model.model : null
+}
+
+function extractRequestInput(
+  payload: Record<string, unknown>,
+  info: Record<string, unknown>,
+  delta: BigTokenBreakdown
+): bigint {
+  const candidates: unknown[] = [
+    info.last_token_usage,
+    info.request_token_usage,
+    info.input_token_usage,
+    payload.last_token_usage,
+    payload.request_token_usage,
+    payload.input_token_usage
+  ]
+  for (const candidate of candidates) {
+    const usage = fromUnknownTokenUsage(candidate)
+    if (usage) return usage.input
+  }
+  return delta.input
 }
 
 async function bootstrapSessionMetadata(path: string, session: StoredSessionState): Promise<StoredSessionState | null> {
@@ -987,20 +1091,39 @@ async function bootstrapSessionMetadata(path: string, session: StoredSessionStat
       const row = JSON.parse(line) as unknown
       if (!isRecord(row) || !isRecord(row.payload)) continue
       const payload = row.payload
-      if (row.type === 'turn_context' && typeof payload.model === 'string') currentModel = payload.model
-      if (payload.type === 'thread_settings_applied' || row.type === 'thread_settings_applied') currentServiceTier = extractServiceTier(payload) ?? currentServiceTier
+      const info = isRecord(payload.info) ? payload.info : undefined
+      const metadataSession: AttributionState = {
+        currentModel,
+        currentServiceTier
+      }
+      if (row.type === 'turn_context' || payload.type === 'thread_settings_applied' || row.type === 'thread_settings_applied') {
+        const attribution = applyAttribution(metadataSession, payload)
+        currentModel = metadataSession.currentModel
+        currentServiceTier = metadataSession.currentServiceTier ?? 'unknown'
+        lastEventModel = attribution.model
+        lastEventServiceTier = attribution.serviceTier
+      }
       if (payload.type !== 'token_count' || !isRecord(payload.info)) continue
       const usage = fromUnknownTokenUsage(payload.info.total_token_usage)
       if (!usage) continue
       latestCumulative = serializeTokens(usage)
-      lastEventModel = extractEventModel(payload, payload.info) ?? currentModel
-      lastEventServiceTier = extractServiceTier(payload) ?? currentServiceTier
+      const attribution = applyAttribution(metadataSession, payload, info)
+      currentModel = metadataSession.currentModel
+      currentServiceTier = metadataSession.currentServiceTier ?? 'unknown'
+      lastEventModel = attribution.model
+      lastEventServiceTier = attribution.serviceTier
     } catch {
       return null
     }
   }
   if (session.lastCumulative && latestCumulative && JSON.stringify(session.lastCumulative) !== JSON.stringify(latestCumulative)) return null
   if (session.lastCumulative && !latestCumulative) return null
+  // Metadata can legally trail the latest token_count. The final attribution
+  // state is the one needed to resume a metadata-free append after bootstrap.
+  if (latestCumulative) {
+    lastEventModel = currentModel
+    lastEventServiceTier = currentServiceTier
+  }
   if (latestCumulative && lastEventModel && lastEventServiceTier) {
     const persistedModel = session.currentModel || 'unknown'
     const persistedServiceTier = session.currentServiceTier ?? 'unknown'
@@ -1045,18 +1168,35 @@ async function readLatestBaseline(path: string, capturedEnd?: number): Promise<{
       const row = JSON.parse(line) as unknown
       if (!isRecord(row) || !isRecord(row.payload)) continue
       const payload = row.payload
-      if (row.type === 'turn_context' && typeof payload.model === 'string') currentModel = payload.model
-      if (payload.type === 'thread_settings_applied' || row.type === 'thread_settings_applied') currentServiceTier = extractServiceTier(payload) ?? currentServiceTier
+      const metadataSession: AttributionState = { currentModel, currentServiceTier }
+      if (row.type === 'turn_context' || payload.type === 'thread_settings_applied' || row.type === 'thread_settings_applied') {
+        applyAttribution(metadataSession, payload)
+        currentModel = metadataSession.currentModel
+        currentServiceTier = metadataSession.currentServiceTier ?? 'unknown'
+      }
       if (payload.type !== 'token_count' || !isRecord(payload.info)) continue
       const usage = fromUnknownTokenUsage(payload.info.total_token_usage)
       if (!usage) continue
-      const model = extractEventModel(payload, payload.info) ?? currentModel
-      const serviceTier = extractServiceTier(payload) ?? currentServiceTier
+      const attribution = applyAttribution(metadataSession, payload, payload.info)
+      currentModel = metadataSession.currentModel
+      currentServiceTier = metadataSession.currentServiceTier ?? 'unknown'
+      const model = attribution.model
+      const serviceTier = attribution.serviceTier
       latest = { cumulative: serializeTokens(usage), model, serviceTier }
     } catch {
       // A trailing partial line does not invalidate the last complete
       // cumulative baseline; the normal stream boundary handles it later.
       continue
+    }
+  }
+  if (latest) {
+    // A trailing turn_context/thread_settings_applied after the last token
+    // changes the inherited metadata for the next append and must be part of
+    // the captured baseline.
+    latest = {
+      ...latest,
+      model: currentModel,
+      serviceTier: currentServiceTier
     }
   }
   return latest
@@ -1110,9 +1250,11 @@ async function recoverRewrittenSession(
         continue
       }
       const payload = row.payload
-      if (row.type === 'turn_context' && typeof payload.model === 'string') currentModel = payload.model
-      if (payload.type === 'thread_settings_applied' || row.type === 'thread_settings_applied') {
-        currentServiceTier = extractServiceTier(payload) ?? currentServiceTier
+      const metadataSession: AttributionState = { currentModel, currentServiceTier }
+      if (row.type === 'turn_context' || payload.type === 'thread_settings_applied' || row.type === 'thread_settings_applied') {
+        applyAttribution(metadataSession, payload)
+        currentModel = metadataSession.currentModel
+        currentServiceTier = metadataSession.currentServiceTier ?? 'unknown'
       }
       if (payload.type === 'token_count' && isRecord(payload.info)) {
         const usage = fromUnknownTokenUsage(payload.info.total_token_usage)
@@ -1121,8 +1263,11 @@ async function recoverRewrittenSession(
           if (JSON.stringify(serializeTokens(usage)) === JSON.stringify(target)) {
             cumulativeMatches += 1
             const info = payload.info
-            const eventModel = extractEventModel(payload, info) ?? currentModel
-            const eventTier = extractServiceTier(payload) ?? currentServiceTier
+            const attribution = applyAttribution(metadataSession, payload, info)
+            currentModel = metadataSession.currentModel
+            currentServiceTier = metadataSession.currentServiceTier ?? 'unknown'
+            const eventModel = attribution.model
+            const eventTier = attribution.serviceTier
             const prefixFingerprint = createHash('sha256').update(Buffer.from(content, 'utf8').subarray(0, end)).digest('hex')
             if (
               JSON.stringify(session.recoveryAnchor.cumulative) === JSON.stringify(target) &&
@@ -1184,5 +1329,9 @@ export const sessionIndexerConstants = {
 export const sessionIndexerInternals = {
   classifyServiceTier: extractServiceTier,
   extractEventModel,
+  extractAttribution,
+  extractRequestInput,
+  readLatestBaseline,
+  captureTailBaseline,
   recoverRewrittenSession
 }

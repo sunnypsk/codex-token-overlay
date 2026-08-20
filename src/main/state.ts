@@ -143,6 +143,8 @@ export interface PersistentState {
   rebuild: RebuildProgress
   /** Durable replay/migration revision for the indexed session projection. */
   indexRevision: number
+  /** Explicit attribution/classification revision for persisted token buckets. */
+  attributionRevision: number
 }
 
 export interface PricingManifestPointer {
@@ -167,7 +169,8 @@ export function createDefaultState(now = new Date().toISOString()): PersistentSt
     pendingPricingQueue: [],
     unreconciledSessions: [],
     rebuild: { state: 'idle', totalFiles: 0, processedFiles: 0, pending: 0, message: null },
-    indexRevision: STATE_INDEX_REVISION
+    indexRevision: STATE_INDEX_REVISION,
+    attributionRevision: ATTRIBUTION_REVISION
   }
 }
 
@@ -189,7 +192,10 @@ export interface StateStoreOptions {
 }
 
 /** Bump when the persisted session projection or replay rules change. */
-export const STATE_INDEX_REVISION = 3
+export const STATE_INDEX_REVISION = 4
+
+/** Bump when model/context/tier attribution rules change. */
+export const ATTRIBUTION_REVISION = 3
 
 export class StateStore {
   private static readonly locks = new Map<string, Promise<void>>()
@@ -329,13 +335,15 @@ export function migrateLegacyState(value: unknown): PersistentState {
   const version = source.version
   if (version === 2 && isStateV2(source)) {
     const persistedRevision = numberOrZero(source.indexRevision)
-    const needsReplay = persistedRevision < STATE_INDEX_REVISION
+    const persistedAttributionRevision = numberOrZero(source.attributionRevision)
+    const needsReplay = persistedRevision < STATE_INDEX_REVISION || persistedAttributionRevision < ATTRIBUTION_REVISION
     const migratedSessions = normalizeV2Sessions(source.sessions, needsReplay)
     return {
       ...defaults,
       ...source,
       version: 2,
       indexRevision: persistedRevision,
+      attributionRevision: persistedAttributionRevision,
       sessions: migratedSessions,
       priceBook: normalizeLegacyPriceBook(source.priceBook, defaults.priceBook),
       pricingLedger: Array.isArray(source.pricingLedger) ? source.pricingLedger as PricingLedgerEntry[] : [],
@@ -377,7 +385,8 @@ export function migrateLegacyState(value: unknown): PersistentState {
     pendingPricingQueue: [],
     unreconciledSessions: Object.keys(sessions),
     rebuild: { state: 'queued', totalFiles: 0, processedFiles: 0, pending: Object.keys(sessions).length, message: 'Migrated from v1; awaiting background reconciliation.' },
-    indexRevision: 0
+    indexRevision: 0,
+    attributionRevision: 0
   }
 }
 
@@ -472,7 +481,7 @@ function prepareLegacySession(session: StoredSessionState): StoredSessionState {
 }
 
 async function mergeLegacyV1Fallback(state: PersistentState, filePath: string): Promise<PersistentState> {
-  if (state.indexRevision >= STATE_INDEX_REVISION) return state
+  if (state.indexRevision >= STATE_INDEX_REVISION && state.attributionRevision >= ATTRIBUTION_REVISION) return state
   let raw: string
   try {
     raw = await readFile(filePath, 'utf8')
@@ -559,6 +568,7 @@ function sha256(value: string): string {
 export const stateConstants = {
   STATE_VERSION: 2,
   INDEX_REVISION: STATE_INDEX_REVISION,
+  ATTRIBUTION_REVISION,
   MANIFEST_SUFFIX: '.manifest.json',
   GENERATION_SUFFIX: '.generations',
   MAX_GENERATIONS_IN_MANIFEST: 2

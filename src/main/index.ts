@@ -21,7 +21,7 @@ if (!usesIsolatedE2eProfile && !app.requestSingleInstanceLock()) {
 
   app.whenReady().then(async () => {
     app.setAppUserModelId('com.local.codextokenoverlay')
-    service = new UsageService(app.getPath('userData'))
+    service = new UsageService(app.getPath('userData'), app.getPath('logs'))
     await service.start()
     applyLoginSetting(service.getSnapshot().settings.startAtLogin)
 

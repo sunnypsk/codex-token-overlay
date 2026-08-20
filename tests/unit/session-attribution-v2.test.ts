@@ -6,6 +6,7 @@ import { sessionIndexerInternals } from '../../src/main/session-indexer.js'
 import { SessionIndexer } from '../../src/main/session-indexer.js'
 import { StateStore } from '../../src/main/state.js'
 import { createBundledPriceBook, normalizeLiteLLMPriceBook, resolveEffectiveModelPricing } from '../../src/main/pricing.js'
+import { buildPeriod } from '../../src/main/aggregation.js'
 
 const roots: string[] = []
 afterEach(async () => { await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))) })
@@ -47,6 +48,59 @@ describe('session pricing attribution v2', () => {
     const aggregate = store.get().sessions[sessionId]?.daily['2026-08-19']?.models
     expect(aggregate?.['gpt-5.6-sol']?.bySpeed?.fast?.short.total).toBe('100')
     expect(aggregate?.['gpt-5.4']?.bySpeed?.standard?.long.total).toBe('272000')
+  })
+
+  it('inherits nested settings model/tier into metadata-free token events and clears explicit unknowns', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'codex-attribution-envelope-v2-'))
+    roots.push(root)
+    const sessions = join(root, 'sessions', '2026', '08', '19')
+    await mkdir(sessions, { recursive: true })
+    const sessionId = '01a00000-0000-7000-8000-000000000085'
+    const file = join(sessions, `rollout-2026-08-19T10-00-00-${sessionId}.jsonl`)
+    const lines = [
+      settingsEvent('2026-08-19T02:00:00.000Z', { model: 'gpt-5.6-sol', service_tier: 'priority' }),
+      tokenEventWithoutMetadata('2026-08-19T02:00:01.000Z', 100, 100, 100),
+      settingsEvent('2026-08-19T02:00:02.000Z', { model: 'gpt-5.6-luna', service_tier: null }),
+      tokenEventWithoutMetadata('2026-08-19T02:00:03.000Z', 300000, 300100, 300000),
+      settingsEvent('2026-08-19T02:00:04.000Z', { model: null, service_tier: 'experimental' }),
+      tokenEventWithoutMetadata('2026-08-19T02:00:05.000Z', 300001, 300101, 1)
+    ]
+    await writeFile(file, `${lines.map((line) => JSON.stringify(line)).join('\n')}\n`, 'utf8')
+    const store = new StateStore(join(root, 'state.json'))
+    await store.load()
+    await new SessionIndexer(root, store, 0, () => undefined).scan()
+    const models = store.get().sessions[sessionId]?.daily['2026-08-19']?.models
+    expect(models?.['gpt-5.6-sol']?.bySpeed?.fast?.short.total).toBe('100')
+    expect(models?.['gpt-5.6-luna']?.bySpeed?.unknown?.long.total).toBe('300000')
+    const unknownSpeed = models?.unknown?.bySpeed?.unknown
+    if (!unknownSpeed?.unknown) throw new Error('Expected explicit unknown model/tier attribution bucket')
+    expect(unknownSpeed.unknown.total).toBe('1')
+    const period = buildPeriod('today', Date.parse('2026-08-18T16:00:00Z'), Date.parse('2026-08-19T04:00:00Z'), store.get())
+    expect(period.cost.pricedTokens).toBe('300000')
+    expect(period.cost.unpricedTokens).toBe('1')
+    expect(period.cost.tierCoveragePercent).toBe(0.03)
+  })
+
+  it('captures trailing attribution after the latest token and prefers request input over cumulative delta', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'codex-baseline-attribution-v2-'))
+    roots.push(root)
+    const file = join(root, 'baseline.jsonl')
+    const lines = [
+      settingsEvent('2026-08-19T02:00:00.000Z', { model: 'gpt-5.6-sol', service_tier: 'priority' }),
+      tokenEventWithoutMetadata('2026-08-19T02:00:01.000Z', 100, 100, 100),
+      settingsEvent('2026-08-19T02:00:02.000Z', { model: 'gpt-5.6-luna', service_tier: null })
+    ]
+    await writeFile(file, `${lines.map((line) => JSON.stringify(line)).join('\n')}\n`, 'utf8')
+    const baseline = await sessionIndexerInternals.readLatestBaseline(file)
+    expect(baseline?.cumulative.total).toBe('100')
+    expect(baseline?.model).toBe('gpt-5.6-luna')
+    expect(baseline?.serviceTier).toBe('unknown')
+    const requestInput = sessionIndexerInternals.extractRequestInput(
+      {},
+      { last_token_usage: { input_tokens: 10, output_tokens: 0, total_tokens: 10 } },
+      { input: 300000n, cachedInput: 0n, cacheWriteInput: 0n, output: 0n, reasoningOutput: 0n, total: 300000n }
+    )
+    expect(requestInput).toBe(10n)
   })
 
   it('uses model-specific effective long thresholds instead of a global 272K decision', async () => {
@@ -120,6 +174,24 @@ function tokenEvent(timestamp: string, input: number, total: number, model: stri
       info: {
         total_token_usage: { input_tokens: input, cached_input_tokens: 0, cache_write_input_tokens: 0, output_tokens: 0, reasoning_output_tokens: 0, total_tokens: total },
         last_token_usage: { input_tokens: input, cached_input_tokens: 0, cache_write_input_tokens: 0, output_tokens: 0, reasoning_output_tokens: 0, total_tokens: total }
+      }
+    }
+  }
+}
+
+function settingsEvent(timestamp: string, settings: Record<string, unknown>): Record<string, unknown> {
+  return { timestamp, type: 'event_msg', payload: { type: 'thread_settings_applied', settings } }
+}
+
+function tokenEventWithoutMetadata(timestamp: string, input: number, total: number, lastInput: number): Record<string, unknown> {
+  return {
+    timestamp,
+    type: 'event_msg',
+    payload: {
+      type: 'token_count',
+      info: {
+        total_token_usage: { input_tokens: input, cached_input_tokens: 0, cache_write_input_tokens: 0, output_tokens: 0, reasoning_output_tokens: 0, total_tokens: total },
+        last_token_usage: { input_tokens: lastInput, cached_input_tokens: 0, cache_write_input_tokens: 0, output_tokens: 0, reasoning_output_tokens: 0, total_tokens: lastInput }
       }
     }
   }

@@ -376,6 +376,144 @@ describe('structured pricing v2 contracts', () => {
     expect(resolveEffectiveModelPricing(book, 'gpt-5.6', '2026-08-18T23:00:00.000Z').price).toBeUndefined()
   })
 
+  it('rejects copied canonical components while preserving separators and verified aliases', () => {
+    const book = createBundledPriceBook()
+    book.models['gpt-5.4-injected'] = { ...book.models['gpt-5.6']! }
+    expect(resolveEffectiveModelPricing(book, 'gpt-5.4-injected', '2026-08-19T02:00:00.000Z').price).toBeUndefined()
+    expect(resolveEffectiveModelPricing(book, 'openai/gpt-5.4', '2026-08-19T02:00:00.000Z').price).toBeDefined()
+    expect(resolveEffectiveModelPricing(book, 'openai/gpt-5.6-codex', '2026-08-19T02:00:00.000Z').price).toBeDefined()
+
+    const invalidSource = {
+      ...book,
+      models: {
+        ...book.models,
+        'gpt-5.4': {
+          ...book.models['gpt-5.4']!,
+          base: { ...book.models['gpt-5.4']!.base!, source: 'untrusted' as never }
+        }
+      }
+    }
+    expect(resolveEffectiveModelPricing(invalidSource, 'gpt-5.4', '2026-08-19T02:00:00.000Z').price).toBeUndefined()
+  })
+
+  it('preserves the canonical key when an eligible historical base is future or malformed', () => {
+    const book = createBundledPriceBook()
+    const modelId = 'gpt-5.4'
+    const canonical = book.models[modelId]!
+    delete book.models[modelId]
+    const ledgerEntry = (model: typeof canonical) => [{
+      effectiveAt: '2026-08-18T00:00:00.000Z',
+      observedAt: '2026-08-18T01:00:00.000Z',
+      models: { [modelId]: model }
+    }]
+    const future = {
+      ...canonical,
+      base: { ...canonical.base!, effectiveAt: '2026-08-20T00:00:00.000Z' }
+    }
+    const malformed = {
+      ...canonical,
+      base: { ...canonical.base!, effectiveAt: 'not-a-date' }
+    }
+    const futureResult = resolveEffectiveModelPricing(book, modelId, '2026-08-19T02:00:00.000Z', ledgerEntry(future))
+    const malformedResult = resolveEffectiveModelPricing(book, modelId, '2026-08-19T02:00:00.000Z', ledgerEntry(malformed))
+    expect(futureResult.resolvedKey).toBe(modelId)
+    expect(futureResult.price).toBeUndefined()
+    expect(futureResult.hasEffectiveBase).toBe(false)
+    expect(malformedResult.resolvedKey).toBe(modelId)
+    expect(malformedResult.price).toBeUndefined()
+    expect(malformedResult.hasEffectiveBase).toBe(false)
+
+    const noEligibleRevision = resolveEffectiveModelPricing(book, modelId, '2026-08-17T23:00:00.000Z', ledgerEntry(canonical))
+    expect(noEligibleRevision.resolvedKey).toBeUndefined()
+  })
+
+  it('selects the latest whole same-effective revision and fails closed for a malformed winner', () => {
+    const book = createBundledPriceBook()
+    const canonical = book.models['gpt-5.6']!
+    const effectiveAt = '2026-08-19T00:00:00.000Z'
+    const revision = (input: string, baseAt = effectiveAt) => ({
+      ...canonical,
+      short: { ...canonical.short, inputMicroUsdPerMillion: input },
+      base: canonical.base ? { ...canonical.base, effectiveAt: baseAt } : undefined,
+      longComponent: canonical.longComponent ? { ...canonical.longComponent, effectiveAt: baseAt } : undefined
+    })
+    const entry = (model: ReturnType<typeof revision>, observedAt?: string | null) => ({
+      effectiveAt,
+      ...(observedAt === undefined ? {} : { observedAt }),
+      models: { 'gpt-5.6': model }
+    })
+    const malformed = revision('9000000', 'not-a-date')
+    const valid = revision('7000000')
+
+    const selected = resolveEffectiveModelPricing(
+      book,
+      'gpt-5.6',
+      '2026-08-19T02:00:00.000Z',
+      [entry(malformed, '2026-08-19T01:00:00.000Z'), entry(valid, '2026-08-19T02:00:00.000Z')]
+    )
+    expect(selected.price?.short.inputMicroUsdPerMillion).toBe('7000000')
+
+    const malformedWinner = resolveEffectiveModelPricing(
+      book,
+      'gpt-5.6',
+      '2026-08-19T02:00:00.000Z',
+      [entry(valid, '2026-08-19T01:00:00.000Z'), entry(malformed, '2026-08-19T02:00:00.000Z')]
+    )
+    expect(malformedWinner.price).toBeUndefined()
+    expect(malformedWinner.hasEffectiveBase).toBe(false)
+  })
+
+  it('orders same-effective revisions by valid observedAt, then append position', () => {
+    const book = createBundledPriceBook()
+    const canonical = book.models['gpt-5.6']!
+    const effectiveAt = '2026-08-19T00:00:00.000Z'
+    const revision = (input: string) => ({
+      ...canonical,
+      short: { ...canonical.short, inputMicroUsdPerMillion: input },
+      base: canonical.base ? { ...canonical.base, effectiveAt } : undefined,
+      longComponent: canonical.longComponent ? { ...canonical.longComponent, effectiveAt } : undefined
+    })
+    const entry = (model: ReturnType<typeof revision>, observedAt?: string | null) => ({
+      effectiveAt,
+      ...(observedAt === undefined ? {} : { observedAt }),
+      models: { 'gpt-5.6': model }
+    })
+
+    // The newer observed revision is appended after the older one.
+    const observedOrder = resolveEffectiveModelPricing(
+      book,
+      'gpt-5.6',
+      '2026-08-19T02:00:00.000Z',
+      [entry(revision('1000000'), '2026-08-19T01:00:00.000Z'), entry(revision('2000000'), '2026-08-19T03:00:00.000Z')]
+    )
+    expect(observedOrder.price?.short.inputMicroUsdPerMillion).toBe('2000000')
+
+    // A valid observedAt beats an invalid one even when the invalid entry is newer.
+    const validObserved = resolveEffectiveModelPricing(
+      book,
+      'gpt-5.6',
+      '2026-08-19T02:00:00.000Z',
+      [entry(revision('3000000'), '2026-08-19T03:00:00.000Z'), entry(revision('4000000'), 'bad-date')]
+    )
+    expect(validObserved.price?.short.inputMicroUsdPerMillion).toBe('3000000')
+
+    const appendTie = resolveEffectiveModelPricing(
+      book,
+      'gpt-5.6',
+      '2026-08-19T02:00:00.000Z',
+      [entry(revision('5000000')), entry(revision('6000000'), 'bad-date')]
+    )
+    expect(appendTie.price?.short.inputMicroUsdPerMillion).toBe('6000000')
+
+    const equalObserved = resolveEffectiveModelPricing(
+      book,
+      'gpt-5.6',
+      '2026-08-19T02:00:00.000Z',
+      [entry(revision('7000000'), '2026-08-19T01:00:00.000Z'), entry(revision('8000000'), '2026-08-19T01:00:00.000Z')]
+    )
+    expect(equalObserved.price?.short.inputMicroUsdPerMillion).toBe('8000000')
+  })
+
   it('fails closed for invalid event/provenance/ledger timestamps', () => {
     const book = createBundledPriceBook()
     expect(resolveEffectiveModelPricing(book, 'gpt-5.6', 'not-a-date').price).toBeUndefined()

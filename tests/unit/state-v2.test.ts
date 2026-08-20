@@ -1,8 +1,9 @@
-import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { createDefaultState, createEmptyStoredModelAggregate, migrateLegacyState, StateStore } from '../../src/main/state.js'
+import { SessionIndexer } from '../../src/main/session-indexer.js'
+import { ATTRIBUTION_REVISION, createDefaultState, createEmptyStoredModelAggregate, migrateLegacyState, STATE_INDEX_REVISION, StateStore } from '../../src/main/state.js'
 
 const roots: string[] = []
 
@@ -120,4 +121,101 @@ describe('state v2 generation persistence', () => {
     expect(recovered.get().sessions.session?.legacyDaily?.['2026-08-19']?.models['gpt-5.6-sol']?.short.total).toBe('100')
     expect(recovered.get().sessions.session?.daily['2026-08-19']?.models['gpt-5.6-sol']).toBeUndefined()
   })
+
+  it('persists the attribution migration marker once and keeps a missing-raw legacy floor across restart', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'codex-attribution-rebuild-v2-'))
+    roots.push(root)
+    const file = join(root, 'usage-state.json')
+    const aggregate = createEmptyStoredModelAggregate()
+    aggregate.short = { input: '100', cachedInput: '0', cacheWriteInput: '0', output: '0', reasoningOutput: '0', total: '100' }
+    await writeFile(file, `${JSON.stringify({
+      ...createDefaultState(),
+      indexRevision: STATE_INDEX_REVISION,
+      attributionRevision: 2,
+      sessions: {
+        missing: {
+          sessionId: 'missing', path: join(root, 'sessions', 'missing.jsonl'), offset: 0, fileSize: 0, modifiedAtMs: 0,
+          currentModel: 'gpt-5.6-sol', lastCumulative: null,
+          daily: { '2026-08-19': { models: { 'gpt-5.6-sol': aggregate } } },
+          cycles: {}, eventCount: 1, parseErrors: 0
+        }
+      }
+    })}\n`, 'utf8')
+    const store = new StateStore(file)
+    await store.load()
+    await new SessionIndexer(root, store, 0, () => undefined).scan()
+    expect(store.get().indexRevision).toBe(STATE_INDEX_REVISION)
+    expect(store.get().attributionRevision).toBe(ATTRIBUTION_REVISION)
+    expect(store.get().rebuild.state).toBe('partial')
+    expect(store.get().sessions.missing?.legacyDaily?.['2026-08-19']?.models['gpt-5.6-sol']?.short.total).toBe('100')
+
+    const restarted = new StateStore(file)
+    await restarted.load()
+    expect(restarted.get().indexRevision).toBe(STATE_INDEX_REVISION)
+    expect(restarted.get().attributionRevision).toBe(ATTRIBUTION_REVISION)
+    expect(restarted.get().rebuild.state).toBe('partial')
+    await new SessionIndexer(root, restarted, 0, () => undefined).scan()
+    expect(restarted.get().sessions.missing?.legacyDaily?.['2026-08-19']?.models['gpt-5.6-sol']?.short.total).toBe('100')
+  })
+
+  it('replays a v2 revision-2 unknown-context projection once without double-counting', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'codex-attribution-revision-3-v2-'))
+    roots.push(root)
+    const file = join(root, 'usage-state.json')
+    const sessionId = '01a00000-0000-7000-8000-000000000090'
+    const sessionPath = join(root, 'sessions', '2026', '08', '19', `rollout-2026-08-19T10-00-00-${sessionId}.jsonl`)
+    await mkdir(join(root, 'sessions', '2026', '08', '19'), { recursive: true })
+    const legacyAggregate = createEmptyStoredModelAggregate()
+    legacyAggregate.unknown = { input: '999', cachedInput: '0', cacheWriteInput: '0', output: '0', reasoningOutput: '0', total: '999' }
+    await writeFile(sessionPath, `${tokenLineForTest(100)}\n${tokenLineForTest(150)}\n`, 'utf8')
+    await writeFile(file, `${JSON.stringify({
+      ...createDefaultState(),
+      indexRevision: STATE_INDEX_REVISION,
+      attributionRevision: 2,
+      sessions: {
+        [sessionId]: {
+          sessionId,
+          path: sessionPath,
+          offset: 0,
+          fileSize: 0,
+          modifiedAtMs: 0,
+          currentModel: 'unknown',
+          lastCumulative: null,
+          daily: { '2026-08-19': { models: { unknown: legacyAggregate } } },
+          cycles: {},
+          eventCount: 1,
+          parseErrors: 0
+        }
+      }
+    })}\n`, 'utf8')
+
+    const store = new StateStore(file)
+    await store.load()
+    expect(store.get().attributionRevision).toBe(2)
+    expect(store.get().rebuild.state).toBe('queued')
+    expect(store.get().rebuild.pending).toBe(1)
+    expect(store.get().sessions[sessionId]?.legacyDaily?.['2026-08-19']?.models.unknown?.unknown?.total).toBe('999')
+
+    await new SessionIndexer(root, store, 0, () => undefined).scan()
+    const converged = store.get().sessions[sessionId]!
+    expect(store.get().attributionRevision).toBe(ATTRIBUTION_REVISION)
+    expect(store.get().rebuild.state).toBe('complete')
+    expect(converged.daily['2026-08-19']?.models.unknown?.unknown?.total).toBe('150')
+
+    await new SessionIndexer(root, store, 0, () => undefined).scan()
+    expect(store.get().sessions[sessionId]?.daily['2026-08-19']?.models.unknown?.unknown?.total).toBe('150')
+  })
 })
+
+function tokenLineForTest(total: number): string {
+  return JSON.stringify({
+    timestamp: '2026-08-19T02:00:02.000Z',
+    type: 'event_msg',
+    payload: {
+      type: 'token_count',
+      info: {
+        total_token_usage: { input_tokens: total, cached_input_tokens: 0, cache_write_input_tokens: 0, output_tokens: 0, reasoning_output_tokens: 0, total_tokens: total }
+      }
+    }
+  })
+}

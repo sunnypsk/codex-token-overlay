@@ -379,6 +379,35 @@ describe('session reconciliation v2', () => {
     await new SessionIndexer(root, reloaded, 0, () => undefined).scan()
     expect(reloaded.get().sessions[sessionId]?.daily['2026-08-19']?.models['gpt-5.4-sol']?.unknown?.total).toBe('90')
   })
+
+  it('keeps trailing rewrite attribution for the next metadata-free token event', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'codex-rewrite-trailing-attribution-v2-'))
+    roots.push(root)
+    const sessions = join(root, 'sessions', '2026', '08', '19')
+    await mkdir(sessions, { recursive: true })
+    const sessionId = '01a00000-0000-7000-8000-000000000084'
+    const file = join(sessions, `rollout-2026-08-19T10-00-00-${sessionId}.jsonl`)
+    const trailingSettings = JSON.stringify({ timestamp: '2026-08-19T02:00:03.000Z', type: 'event_msg', payload: { type: 'thread_settings_applied', settings: { model: 'gpt-5.6-luna', service_tier: null } } })
+    await writeFile(file, `${JSON.stringify({ timestamp: '2026-08-19T02:00:00.000Z', type: 'turn_context', payload: { model: 'gpt-5.6-sol' } })}\n${JSON.stringify({ timestamp: '2026-08-19T02:00:01.000Z', type: 'event_msg', payload: { type: 'thread_settings_applied', settings: { service_tier: 'standard' } } })}\n${tokenLine(100, 60, 10, 110)}\n${trailingSettings}\n`, 'utf8')
+    const store = new StateStore(join(root, 'state.json'))
+    await store.load()
+    const indexer = new SessionIndexer(root, store, 0, () => undefined)
+    await indexer.scan()
+    const rewritten = rewriteJsonlExact(await readText(file), (value) => {
+      if (value.payload?.type === 'token_count') {
+        value.payload.info.total_token_usage = { input_tokens: 200, cached_input_tokens: 80, cache_write_input_tokens: 0, output_tokens: 20, reasoning_output_tokens: 5, total_tokens: 220 }
+        value.payload.info.last_token_usage = { input_tokens: 200, cached_input_tokens: 80, cache_write_input_tokens: 0, output_tokens: 20, reasoning_output_tokens: 5, total_tokens: 220 }
+      }
+      return value
+    })
+    await writeFile(file, rewritten, 'utf8')
+    await indexer.scan()
+    expect(store.get().sessions[sessionId]?.baselineModel).toBe('gpt-5.6-luna')
+    expect(store.get().sessions[sessionId]?.baselineServiceTier).toBe('unknown')
+    await appendFile(file, tokenLine(280, 240, 20, 300) + '\n', 'utf8')
+    await indexer.scan()
+    expect(store.get().sessions[sessionId]?.daily['2026-08-19']?.models['gpt-5.6-luna']?.bySpeed?.unknown?.short.total).toBe('80')
+  })
 })
 
 async function makeSession(token: string, model = 'gpt-5.6-sol', partial = false): Promise<{ root: string; file: string; sessionId: string }> {
