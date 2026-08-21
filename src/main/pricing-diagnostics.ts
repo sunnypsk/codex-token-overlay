@@ -74,6 +74,11 @@ export interface PricingDiagnosticSummary {
     totalFiles: number
     pending: number
     unreconciledSessions: number
+    mode: string
+    replayedSessions: number
+    retainedLegacySessions: number
+    rawTokenDelta: string
+    failureDiagnostics: string[]
   }
   totals: {
     localTokens: string
@@ -215,7 +220,12 @@ export function buildPricingDiagnosticSummary(
       processedFiles: safeNumber(state.rebuild.processedFiles),
       totalFiles: safeNumber(state.rebuild.totalFiles),
       pending: safeNumber(state.rebuild.pending),
-      unreconciledSessions: safeNumber(state.unreconciledSessions.length)
+      unreconciledSessions: safeNumber(state.unreconciledSessions.length),
+      mode: safeRebuildMode(state.rebuild.mode),
+      replayedSessions: safeNumber(state.rebuild.replayedSessions),
+      retainedLegacySessions: safeNumber(state.rebuild.retainedLegacySessions),
+      rawTokenDelta: safeSignedCount(state.rebuild.rawTokenDelta),
+      failureDiagnostics: safeFailureDiagnostics(state.rebuild.failureDiagnostics)
     },
     totals: {
       localTokens: boundedDecimal(totals.localTokens),
@@ -327,7 +337,12 @@ function sanitizeSummaryForWrite(summary: PricingDiagnosticSummary): PricingDiag
       processedFiles: 0,
       totalFiles: 0,
       pending: 0,
-      unreconciledSessions: 0
+      unreconciledSessions: 0,
+      mode: 'unknown',
+      replayedSessions: 0,
+      retainedLegacySessions: 0,
+      rawTokenDelta: '0',
+      failureDiagnostics: []
     },
     totals: {
       localTokens: 'overflow#0000000000000000',
@@ -446,11 +461,17 @@ function isSafeDiagnosticRecord(value: unknown): boolean {
   const rebuild = record.rebuild
   if (!rebuild || typeof rebuild !== 'object' || Array.isArray(rebuild)) return false
   const rebuildRecord = rebuild as Record<string, unknown>
-  if (Object.keys(rebuildRecord).some((key) => !['state', 'indexRevision', 'attributionRevision', 'processedFiles', 'totalFiles', 'pending', 'unreconciledSessions'].includes(key))) return false
+  if (Object.keys(rebuildRecord).some((key) => !['state', 'indexRevision', 'attributionRevision', 'processedFiles', 'totalFiles', 'pending', 'unreconciledSessions', 'mode', 'replayedSessions', 'retainedLegacySessions', 'rawTokenDelta', 'failureDiagnostics'].includes(key))) return false
   if (rebuildRecord.state !== safeRebuildState(rebuildRecord.state)) return false
   for (const key of ['indexRevision', 'attributionRevision', 'processedFiles', 'totalFiles', 'pending', 'unreconciledSessions']) {
     if (!isFiniteInteger(rebuildRecord[key])) return false
   }
+  if (rebuildRecord.mode !== safeRebuildMode(rebuildRecord.mode)) return false
+  for (const key of ['replayedSessions', 'retainedLegacySessions']) {
+    if (!isFiniteInteger(rebuildRecord[key])) return false
+  }
+  if (!isSignedCount(rebuildRecord.rawTokenDelta)) return false
+  if (!Array.isArray(rebuildRecord.failureDiagnostics) || rebuildRecord.failureDiagnostics.length > 32 || !rebuildRecord.failureDiagnostics.every((item) => isSafeFailureDiagnostic(item))) return false
   const totals = record.totals
   if (!totals || typeof totals !== 'object' || Array.isArray(totals)) return false
   if (Object.keys(totals as Record<string, unknown>).some((key) => !['localTokens', 'pricedTokens', 'unpricedTokens', 'lowerBoundTokens', 'overflowBuckets'].includes(key))) return false
@@ -480,6 +501,28 @@ function isFiniteInteger(value: unknown): value is number {
 
 function isBoundedCount(value: unknown): value is string {
   return typeof value === 'string' && ((/^\d+$/u.test(value) && value.length <= MAX_DECIMAL_DIGITS) || /^overflow#[0-9a-f]{16}$/u.test(value))
+}
+
+function isSignedCount(value: unknown): value is string {
+  return typeof value === 'string' && /^-?\d+$/u.test(value) && value.replace(/^-?/u, '').length <= MAX_DECIMAL_DIGITS
+}
+
+function safeSignedCount(value: unknown): string {
+  return isSignedCount(value) ? value : '0'
+}
+
+function safeRebuildMode(value: unknown): string {
+  return value === 'background-replay' || value === 'incremental' || value === 'idle' || value === 'unknown'
+    ? value
+    : 'unknown'
+}
+
+function isSafeFailureDiagnostic(value: unknown): value is string {
+  return value === 'raw-missing' || value === 'raw-invalid' || value === 'raw-unstable' || value === 'raw-read-failed'
+}
+
+function safeFailureDiagnostics(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter(isSafeFailureDiagnostic).slice(0, 32) : []
 }
 
 function isSafeDigestOrNull(value: unknown): boolean {

@@ -65,6 +65,52 @@ describe('state v2 generation persistence', () => {
     expect(await readFile(file, 'utf8')).toBe('legacy-untouched\n')
   })
 
+  it('awaits a post-cutover generation when mutation lands during an in-flight save', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'codex-state-cutover-durability-v2-'))
+    roots.push(root)
+    const file = join(root, 'usage-state.json')
+    const store = new StateStore(file)
+    await store.load()
+    let writes = 0
+    let releaseWrite!: () => void
+    let started!: () => void
+    const gate = new Promise<void>((resolve) => { releaseWrite = resolve })
+    const firstWriteStarted = new Promise<void>((resolve) => { started = resolve })
+    const target = store as unknown as { writeGenerationAtomically: () => Promise<void> }
+    const original = target.writeGenerationAtomically.bind(store)
+    target.writeGenerationAtomically = async () => {
+      writes += 1
+      if (writes === 1) {
+        started()
+        await gate
+      }
+      await original()
+    }
+
+    const firstSave = store.save()
+    await firstWriteStarted
+    const cutover = store.replaceStateAtomically((state) => {
+      state.indexRevision = STATE_INDEX_REVISION
+      state.rebuild.mode = 'background-replay'
+      state.sessions.cutover = {
+        sessionId: 'cutover', path: 'cutover.jsonl', offset: 1, fileSize: 1, modifiedAtMs: 1,
+        currentModel: 'gpt-5.6-sol', currentServiceTier: 'standard', lastCumulative: null,
+        daily: {}, cycles: {}, eventCount: 0, parseErrors: 0
+      }
+    })
+    releaseWrite()
+    await Promise.all([firstSave, cutover])
+    target.writeGenerationAtomically = original
+    expect(writes).toBeGreaterThanOrEqual(2)
+
+    const reloaded = new StateStore(file)
+    await reloaded.load()
+    expect(reloaded.get().indexRevision).toBe(STATE_INDEX_REVISION)
+    expect(reloaded.get().rebuild.mode).toBe('background-replay')
+    expect(reloaded.get().sessions.cutover?.sessionId).toBe('cutover')
+    expect((await reloaded.readManifest())?.previous).toBeDefined()
+  })
+
   it('normalizes persisted processing work back to pending after a restart', () => {
     const migrated = migrateLegacyState({
       ...createDefaultState(),
@@ -119,7 +165,7 @@ describe('state v2 generation persistence', () => {
     expect(recovered.get().settings.expanded).toBe(true)
     expect(recovered.get().account.lifetimeTokens).toBe('active-account')
     expect(recovered.get().sessions.session?.legacyDaily?.['2026-08-19']?.models['gpt-5.6-sol']?.short.total).toBe('100')
-    expect(recovered.get().sessions.session?.daily['2026-08-19']?.models['gpt-5.6-sol']).toBeUndefined()
+    expect(recovered.get().sessions.session?.daily['2026-08-19']?.models['gpt-5.6-sol']?.short.total).toBe('200')
   })
 
   it('persists the attribution migration marker once and keeps a missing-raw legacy floor across restart', async () => {
@@ -147,7 +193,7 @@ describe('state v2 generation persistence', () => {
     expect(store.get().indexRevision).toBe(STATE_INDEX_REVISION)
     expect(store.get().attributionRevision).toBe(ATTRIBUTION_REVISION)
     expect(store.get().rebuild.state).toBe('partial')
-    expect(store.get().sessions.missing?.legacyDaily?.['2026-08-19']?.models['gpt-5.6-sol']?.short.total).toBe('100')
+    expect(store.get().sessions.missing?.daily['2026-08-19']?.models['gpt-5.6-sol']?.short.total).toBe('100')
 
     const restarted = new StateStore(file)
     await restarted.load()
@@ -155,7 +201,7 @@ describe('state v2 generation persistence', () => {
     expect(restarted.get().attributionRevision).toBe(ATTRIBUTION_REVISION)
     expect(restarted.get().rebuild.state).toBe('partial')
     await new SessionIndexer(root, restarted, 0, () => undefined).scan()
-    expect(restarted.get().sessions.missing?.legacyDaily?.['2026-08-19']?.models['gpt-5.6-sol']?.short.total).toBe('100')
+    expect(restarted.get().sessions.missing?.daily['2026-08-19']?.models['gpt-5.6-sol']?.short.total).toBe('100')
   })
 
   it('replays a v2 revision-2 unknown-context projection once without double-counting', async () => {
@@ -194,7 +240,7 @@ describe('state v2 generation persistence', () => {
     expect(store.get().attributionRevision).toBe(2)
     expect(store.get().rebuild.state).toBe('queued')
     expect(store.get().rebuild.pending).toBe(1)
-    expect(store.get().sessions[sessionId]?.legacyDaily?.['2026-08-19']?.models.unknown?.unknown?.total).toBe('999')
+    expect(store.get().sessions[sessionId]?.daily['2026-08-19']?.models.unknown?.unknown?.total).toBe('999')
 
     await new SessionIndexer(root, store, 0, () => undefined).scan()
     const converged = store.get().sessions[sessionId]!

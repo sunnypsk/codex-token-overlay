@@ -71,7 +71,7 @@ export class UsageService extends EventEmitter {
         // periodic index interval. Startup creates the indexer after the
         // initial pricing refresh, so it cannot replay against an invalid
         // legacy book.
-        void this.indexer?.scan()
+        void this.indexer?.scan('pricing')
       },
       (input, init) => net.fetch(input, init)
     )
@@ -124,7 +124,7 @@ export class UsageService extends EventEmitter {
       this.ensureConnected(),
       this.syncRateLimits(),
       this.syncAccountUsage(),
-      this.indexer?.scan() ?? Promise.resolve(),
+      this.indexer?.scan('manual') ?? Promise.resolve(),
       this.pricing.refreshIfDue(true)
     ])
     this.emitSnapshot()

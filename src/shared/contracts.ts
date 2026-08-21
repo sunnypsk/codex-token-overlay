@@ -147,6 +147,12 @@ export interface FreshnessStatus {
     totalFiles: number
     pending: number
     message: string | null
+    /** Expanded provenance for a background replay or incremental rebuild. */
+    mode?: string
+    replayedSessions?: number
+    retainedLegacySessions?: number
+    rawTokenDelta?: string
+    failureDiagnostics?: string[]
   }
 }
 

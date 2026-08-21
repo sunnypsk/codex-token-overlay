@@ -270,6 +270,10 @@ function PricingDetails({
         {freshness.appServer === 'offline' && <span className="warning-text">Offline/local data</span>}
         {(freshness.pendingPricing ?? 0) > 0 && <span>Pending {freshness.pendingPricing}</span>}
         {progress && progress.state !== 'idle' && <span>{progress.state} {progress.processedFiles}/{progress.totalFiles}</span>}
+        {progress && (progress.replayedSessions ?? 0) > 0 && <span>Raw replay {progress.replayedSessions}</span>}
+        {progress && (progress.retainedLegacySessions ?? 0) > 0 && <span className="warning-text">Legacy retained {progress.retainedLegacySessions}</span>}
+        {progress && progress.rawTokenDelta && progress.rawTokenDelta !== '0' && <span>Raw delta {progress.rawTokenDelta}</span>}
+        {progress && (progress.failureDiagnostics?.length ?? 0) > 0 && <span className="warning-text" title={progress.failureDiagnostics?.join(', ')}>Replay diagnostics</span>}
       </div>
       {freshness.pricingComponents && freshness.pricingComponents.length > 0 && (
         <div className="pricing-components">

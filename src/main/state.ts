@@ -78,6 +78,8 @@ export interface StoredSessionState {
   legacyUnpriced?: boolean
   unreconciled?: boolean
   missingRaw?: boolean
+  /** Full byte-0 raw replay remains required after a failed migration. */
+  fullRawReplayPending?: boolean
   fingerprintBootstrapPending?: boolean
   baselineOffset?: number
   baselinePrefixFingerprint?: string
@@ -125,6 +127,12 @@ export interface RebuildProgress {
   processedFiles: number
   pending: number
   message: string | null
+  /** Provenance for the latest rebuild; optional for old v2 state files. */
+  mode?: string
+  replayedSessions?: number
+  retainedLegacySessions?: number
+  rawTokenDelta?: string
+  failureDiagnostics?: string[]
 }
 
 export interface PersistentState {
@@ -168,7 +176,18 @@ export function createDefaultState(now = new Date().toISOString()): PersistentSt
     pricingLedger: [],
     pendingPricingQueue: [],
     unreconciledSessions: [],
-    rebuild: { state: 'idle', totalFiles: 0, processedFiles: 0, pending: 0, message: null },
+    rebuild: {
+      state: 'idle',
+      totalFiles: 0,
+      processedFiles: 0,
+      pending: 0,
+      message: null,
+      mode: 'idle',
+      replayedSessions: 0,
+      retainedLegacySessions: 0,
+      rawTokenDelta: '0',
+      failureDiagnostics: []
+    },
     indexRevision: STATE_INDEX_REVISION,
     attributionRevision: ATTRIBUTION_REVISION
   }
@@ -192,16 +211,18 @@ export interface StateStoreOptions {
 }
 
 /** Bump when the persisted session projection or replay rules change. */
-export const STATE_INDEX_REVISION = 4
+export const STATE_INDEX_REVISION = 5
 
 /** Bump when model/context/tier attribution rules change. */
-export const ATTRIBUTION_REVISION = 3
+export const ATTRIBUTION_REVISION = 4
 
 export class StateStore {
   private static readonly locks = new Map<string, Promise<void>>()
   private state: PersistentState = createDefaultState()
   private saveTimer: NodeJS.Timeout | null = null
   private saving: Promise<void> | null = null
+  private mutationRevision = 0
+  private durableRevision = -1
   private readonly generationDirectory: string
   private readonly manifestPath: string
   private readonly legacyFallback: boolean
@@ -218,6 +239,7 @@ export class StateStore {
       const parsed = await this.readGeneration(candidate)
       if (parsed) {
         this.state = await mergeLegacyV1Fallback(parsed, this.filePath)
+        this.resetDurabilityTracking()
         return this.state
       }
     }
@@ -227,6 +249,7 @@ export class StateStore {
         const parsed = JSON.parse(raw) as unknown
         if (isStateLike(parsed)) {
           this.state = migrateLegacyState(parsed)
+          this.resetDurabilityTracking()
           return this.state
         }
       } catch (error) {
@@ -235,6 +258,7 @@ export class StateStore {
       }
     }
     this.state = createDefaultState()
+    this.resetDurabilityTracking()
     return this.state
   }
 
@@ -244,8 +268,23 @@ export class StateStore {
 
   update(mutator: (state: PersistentState) => void, saveImmediately = false): void {
     mutator(this.state)
+    this.mutationRevision += 1
     if (saveImmediately) void this.save()
     else this.scheduleSave()
+  }
+
+  /**
+   * Apply a projection cutover as one in-memory mutation and await its
+   * durable generation write. The overload also accepts a complete state for
+   * callers that already prepared an atomic replacement.
+   */
+  async replaceStateAtomically(next: PersistentState | ((state: PersistentState) => void)): Promise<void> {
+    if (typeof next === 'function') this.update(next)
+    else {
+      this.state = { ...next, version: 2 }
+      this.mutationRevision += 1
+    }
+    await this.save()
   }
 
   scheduleSave(delayMs = 750): void {
@@ -261,19 +300,32 @@ export class StateStore {
       clearTimeout(this.saveTimer)
       this.saveTimer = null
     }
-    if (this.saving) {
-      await this.saving
-      return
+    while (this.durableRevision < this.mutationRevision || this.durableRevision < 0) {
+      const targetRevision = this.mutationRevision
+      if (this.saving) {
+        await this.saving
+        continue
+      }
+      const previous = StateStore.locks.get(this.filePath) ?? Promise.resolve()
+      const write = previous.catch(() => undefined).then(() => this.writeGenerationAtomically())
+      this.saving = write
+      StateStore.locks.set(this.filePath, write)
+      try {
+        await write
+        // If a mutation landed while the generation was being written, keep
+        // the durable marker behind it so this same awaited save must create
+        // and await a follow-up generation.
+        this.durableRevision = targetRevision
+      } finally {
+        if (StateStore.locks.get(this.filePath) === write) StateStore.locks.delete(this.filePath)
+        if (this.saving === write) this.saving = null
+      }
     }
-    const previous = StateStore.locks.get(this.filePath) ?? Promise.resolve()
-    this.saving = previous.catch(() => undefined).then(() => this.writeGenerationAtomically())
-    StateStore.locks.set(this.filePath, this.saving)
-    try {
-      await this.saving
-    } finally {
-      if (StateStore.locks.get(this.filePath) === this.saving) StateStore.locks.delete(this.filePath)
-      this.saving = null
-    }
+  }
+
+  private resetDurabilityTracking(): void {
+    this.mutationRevision = 0
+    this.durableRevision = -1
   }
 
   async readManifest(): Promise<PricingManifestPointer | null> {
@@ -337,7 +389,7 @@ export function migrateLegacyState(value: unknown): PersistentState {
     const persistedRevision = numberOrZero(source.indexRevision)
     const persistedAttributionRevision = numberOrZero(source.attributionRevision)
     const needsReplay = persistedRevision < STATE_INDEX_REVISION || persistedAttributionRevision < ATTRIBUTION_REVISION
-    const migratedSessions = normalizeV2Sessions(source.sessions, needsReplay)
+    const migratedSessions = normalizeV2Sessions(source.sessions)
     return {
       ...defaults,
       ...source,
@@ -350,7 +402,18 @@ export function migrateLegacyState(value: unknown): PersistentState {
       pendingPricingQueue: normalizePricingQueue(source.pendingPricingQueue),
       unreconciledSessions: Array.isArray(source.unreconciledSessions) ? source.unreconciledSessions.filter((item): item is string => typeof item === 'string') : [],
       rebuild: needsReplay
-        ? { state: 'queued', totalFiles: 0, processedFiles: 0, pending: Object.keys(migratedSessions).length, message: 'Indexed projection revision is old; awaiting atomic raw replay.' }
+        ? {
+            state: 'queued',
+            totalFiles: 0,
+            processedFiles: 0,
+            pending: Object.keys(migratedSessions).length,
+            message: 'Indexed projection revision is old; awaiting atomic raw replay.',
+            mode: 'background-replay',
+            replayedSessions: 0,
+            retainedLegacySessions: 0,
+            rawTokenDelta: '0',
+            failureDiagnostics: []
+          }
         : isRecord(source.rebuild) ? normalizeRebuild(source.rebuild) : defaults.rebuild
     }
   }
@@ -384,7 +447,18 @@ export function migrateLegacyState(value: unknown): PersistentState {
     pricingLedger: [],
     pendingPricingQueue: [],
     unreconciledSessions: Object.keys(sessions),
-    rebuild: { state: 'queued', totalFiles: 0, processedFiles: 0, pending: Object.keys(sessions).length, message: 'Migrated from v1; awaiting background reconciliation.' },
+    rebuild: {
+      state: 'queued',
+      totalFiles: 0,
+      processedFiles: 0,
+      pending: Object.keys(sessions).length,
+      message: 'Migrated from v1; awaiting background reconciliation.',
+      mode: 'background-replay',
+      replayedSessions: 0,
+      retainedLegacySessions: 0,
+      rawTokenDelta: '0',
+      failureDiagnostics: []
+    },
     indexRevision: 0,
     attributionRevision: 0
   }
@@ -414,11 +488,18 @@ function normalizeRebuild(value: Record<string, unknown>): RebuildProgress {
     totalFiles: numberOrZero(value.totalFiles),
     processedFiles: numberOrZero(value.processedFiles),
     pending: numberOrZero(value.pending),
-    message: typeof value.message === 'string' ? value.message : null
+    message: typeof value.message === 'string' ? value.message : null,
+    mode: typeof value.mode === 'string' ? value.mode : undefined,
+    replayedSessions: numberOrZero(value.replayedSessions),
+    retainedLegacySessions: numberOrZero(value.retainedLegacySessions),
+    rawTokenDelta: typeof value.rawTokenDelta === 'string' ? value.rawTokenDelta : '0',
+    failureDiagnostics: Array.isArray(value.failureDiagnostics)
+      ? value.failureDiagnostics.filter((item): item is string => typeof item === 'string').slice(0, 32)
+      : []
   }
 }
 
-function normalizeV2Sessions(value: unknown, needsReplay = false): Record<string, StoredSessionState> {
+function normalizeV2Sessions(value: unknown): Record<string, StoredSessionState> {
   if (!isRecord(value)) return {}
   const sessions: Record<string, StoredSessionState> = {}
   for (const [sessionId, raw] of Object.entries(value)) {
@@ -432,9 +513,14 @@ function normalizeV2Sessions(value: unknown, needsReplay = false): Record<string
       cycles: isRecord(session.cycles) ? session.cycles : {},
       fingerprintBootstrapPending: !session.prefixFingerprint || !session.recoveryAnchor,
       pricingSemanticHash: typeof session.pricingSemanticHash === 'string' ? session.pricingSemanticHash : null,
-      pricingIndexRevision: numberOrZero(session.pricingIndexRevision)
+      pricingIndexRevision: numberOrZero(session.pricingIndexRevision),
+      fullRawReplayPending: session.fullRawReplayPending === true
     }
-    sessions[sessionId] = needsReplay ? prepareLegacySession(normalized) : normalized
+    // Keep both the v0.1.4 legacy fallback and the current split projection
+    // during a revision migration. The sidecar replay decides atomically
+    // whether raw replaces both; a failed/missing raw read must retain the
+    // exact composite instead of silently dropping the current slice.
+    sessions[sessionId] = normalized
   }
   return sessions
 }
@@ -512,7 +598,18 @@ async function mergeLegacyV1Fallback(state: PersistentState, filePath: string): 
     state.sessions[sessionId] = session
     if (!state.unreconciledSessions.includes(sessionId)) state.unreconciledSessions.push(sessionId)
   }
-  state.rebuild = { state: 'queued', totalFiles: 0, processedFiles: 0, pending: Object.keys(state.sessions).length, message: 'Indexed projection is old; v1 fallback and raw replay are pending.' }
+  state.rebuild = {
+    state: 'queued',
+    totalFiles: 0,
+    processedFiles: 0,
+    pending: Object.keys(state.sessions).length,
+    message: 'Indexed projection is old; v1 fallback and raw replay are pending.',
+    mode: 'background-replay',
+    replayedSessions: 0,
+    retainedLegacySessions: 0,
+    rawTokenDelta: '0',
+    failureDiagnostics: []
+  }
   return state
 }
 

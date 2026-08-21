@@ -139,7 +139,9 @@ describe('session reconciliation v2', () => {
       }
       return value
     })
+    const beforeFirstRewrite = await stat(file)
     await writeFile(file, firstRewrite, 'utf8')
+    await utimes(file, beforeFirstRewrite.atime, new Date(beforeFirstRewrite.mtimeMs + 1_000))
     await indexer.scan()
     expect(store.get().sessions[sessionId]?.baselineCumulative?.total).toBe('220')
 
@@ -149,7 +151,9 @@ describe('session reconciliation v2', () => {
       if (value.type === 'turn_context') value.payload.model = 'gpt-5.6'
       return value
     })
+    const beforeCurrentRewrite = await stat(file)
     await writeFile(file, currentPrefix, 'utf8')
+    await utimes(file, beforeCurrentRewrite.atime, new Date(beforeCurrentRewrite.mtimeMs + 1_000))
     const changedPricing = createDefaultState().priceBook
     changedPricing.models['gpt-5.6'] = { ...changedPricing.models['gpt-5.6']!, longContextThreshold: '1' }
     changedPricing.payloadSha256 = canonicalPricingHash(changedPricing.models)
@@ -185,7 +189,9 @@ describe('session reconciliation v2', () => {
       }
       return value
     })
+    const beforeRewrite = await stat(file)
     await writeFile(file, rewritten, 'utf8')
+    await utimes(file, beforeRewrite.atime, new Date(beforeRewrite.mtimeMs + 1_000))
     await indexer.scan()
     const floorOffset = store.get().sessions[sessionId]?.baselineOffset
     expect(store.get().sessions[sessionId]?.baselineCumulative?.total).toBe('220')
@@ -205,7 +211,7 @@ describe('session reconciliation v2', () => {
     expect(store.get().sessions[sessionId]?.daily['2026-08-19']?.models['gpt-5.6-sol']?.short.total).toBe('280')
   })
 
-  it('detects a same-size content rewrite even when only the fingerprint changes', async () => {
+  it('detects a same-size content rewrite with changed metadata and fingerprint', async () => {
     const { file, root, sessionId } = await makeSession(tokenLine(100, 60, 10, 110))
     const store = new StateStore(join(root, 'state.json'))
     await store.load()
@@ -224,7 +230,9 @@ describe('session reconciliation v2', () => {
     })
     expect(Buffer.byteLength(rewritten)).toBe(Buffer.byteLength(original))
     expect(rewritten.split(/\n/).length).toBe(original.split(/\n/).length)
+    const beforeRewrite = await stat(file)
     await writeFile(file, rewritten, 'utf8')
+    await utimes(file, beforeRewrite.atime, new Date(beforeRewrite.mtimeMs + 1_000))
     expect((await stat(file)).size).toBe(Buffer.byteLength(original))
     await indexer.scan()
     const after = store.get().sessions[sessionId]!
@@ -267,7 +275,9 @@ describe('session reconciliation v2', () => {
       return value
     })
     expect(Buffer.byteLength(original)).toBe(Buffer.byteLength(rewritten))
+    const beforeRewrite = await stat(file)
     await writeFile(file, rewritten, 'utf8')
+    await utimes(file, beforeRewrite.atime, new Date(beforeRewrite.mtimeMs + 1_000))
     await indexer.scan()
     expect(store.get().sessions[sessionId]?.unreconciled).toBe(false)
     expect(store.get().sessions[sessionId]?.legacyUnpriced).toBe(false)
@@ -366,7 +376,9 @@ describe('session reconciliation v2', () => {
       return value
     })
     expect(Buffer.byteLength(rewritten)).toBe(Buffer.byteLength(original))
+    const beforeMetadataRewrite = await stat(file)
     await writeFile(file, rewritten, 'utf8')
+    await utimes(file, beforeMetadataRewrite.atime, new Date(beforeMetadataRewrite.mtimeMs + 1_000))
     const reloaded = new StateStore(legacyStatePath)
     await reloaded.load()
     expect(reloaded.get().sessions[sessionId]?.fingerprintBootstrapPending).toBe(true)
@@ -400,7 +412,9 @@ describe('session reconciliation v2', () => {
       }
       return value
     })
+    const beforeTrailingRewrite = await stat(file)
     await writeFile(file, rewritten, 'utf8')
+    await utimes(file, beforeTrailingRewrite.atime, new Date(beforeTrailingRewrite.mtimeMs + 1_000))
     await indexer.scan()
     expect(store.get().sessions[sessionId]?.baselineModel).toBe('gpt-5.6-luna')
     expect(store.get().sessions[sessionId]?.baselineServiceTier).toBe('unknown')
