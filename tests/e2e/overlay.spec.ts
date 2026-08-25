@@ -117,7 +117,9 @@ test('renders live usage and toggles between collapsed and expanded views', asyn
     await expect(page.getByText('RESET WINDOW', { exact: true })).toBeVisible()
     await expect(page.getByText('CURRENT-WEEK PACE')).toBeVisible()
     await expect(page.locator('.projection-row')).toBeVisible()
-    await expect(page.getByText('API-EQUIVALENT')).toBeVisible()
+    await expect(page.getByText('Estimated weekly API-equivalent', { exact: true })).toBeVisible()
+    await expect(page.locator('.api-equivalent-row')).toBeVisible()
+    await expect(page.locator('.cost-block .eyebrow')).toHaveText('API-EQUIVALENT')
 
     await page.getByRole('button', { name: 'Refresh' }).click()
     await expect(page.locator('.spin')).toHaveCount(0, { timeout: 20_000 })
@@ -126,6 +128,14 @@ test('renders live usage and toggles between collapsed and expanded views', asyn
         .codexOverlay.getSnapshot()
     )
     expect(refreshed.freshness.pricingCheckedAt).not.toBeNull()
+
+    await page.getByRole('button', { name: '7 Days' }).click()
+    await expect(page.getByText('TOKEN USE TREND', { exact: true })).toBeVisible()
+    await expect(page.getByText('LAST 7 DAYS', { exact: true })).toBeVisible()
+    await expect(page.getByText('Daily total · Account first, local fallback · HKT', { exact: true })).toBeVisible()
+    await page.getByRole('button', { name: '30 Days' }).click()
+    await expect(page.getByText('LAST 30 DAYS', { exact: true })).toBeVisible()
+    await page.getByRole('button', { name: 'Today' }).click()
 
     const typography = await page.evaluate(() => {
       const browser = globalThis as unknown as BrowserGlobal

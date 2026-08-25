@@ -1,12 +1,15 @@
 import type {
   CapacityEstimate,
+  CurrentWeekEstimate,
   DashboardSnapshot,
+  DailyUsagePoint,
   FreshnessStatus,
   ModelUsageSummary,
   PeriodKey,
   PeriodSummary,
   QuotaProjection,
   RateLimitBucket,
+  RateLimitWindow,
   ResetSummary,
   TokenBreakdown
 } from '../shared/contracts.js'
@@ -36,6 +39,7 @@ import {
   dateKeysBetween,
   formatHongKongIso,
   hongKongDateKey,
+  rollingHongKongDateRange,
   startOfHongKongDay,
   startOfHongKongMonth,
   startOfHongKongWeek
@@ -67,11 +71,15 @@ interface PricingSegment {
 
 type ModelsBig = Record<string, ModelAggregateBig>
 
+const RESET_DRIFT_TOLERANCE_SECONDS = 5
+
 interface AggregatedCycle {
   limitId: string
   resetsAt: number
   windowDurationMins: number
   models: ModelsBig
+  /** Keep each persisted cycle/model slice separate for effective-dated pricing. */
+  pricingSegments?: PricingSegment[]
   usedPercents: Set<number>
 }
 
@@ -134,7 +142,10 @@ export function buildPeriod(
   endMs: number,
   state: PersistentState
 ): PeriodSummary {
-  const dateKeys = dateKeysBetween(startMs, endMs)
+  const rollingDayCount = key === 'week' ? 7 : key === 'month' ? 30 : null
+  const rollingRange = rollingDayCount === null ? null : rollingHongKongDateRange(endMs, rollingDayCount)
+  const dateKeys = rollingRange?.dateKeys ?? dateKeysBetween(startMs, endMs)
+  const periodStartMs = rollingRange?.startMs ?? startMs
   const dateSet = new Set(dateKeys)
   const models = aggregateDailyModels(state, dateSet)
   const pricingSegments = collectPricingSegments(state, dateSet)
@@ -146,18 +157,38 @@ export function buildPeriod(
   let usedLocal = false
   let liveAccountSyncPending = false
 
+  const dailyUsage: DailyUsagePoint[] = []
   for (const dateKey of dateKeys) {
     const accountValue = state.account.dailyUsageBuckets[dateKey]
-    if (accountValue !== undefined) {
-      const accountDay = safeBigInt(accountValue)
+    const accountDay = parseNonNegativeTokenCount(accountValue)
+    if (accountDay !== null) {
       authoritativeTokens += accountDay
       accountTokens += accountDay
       usedAccount = true
+      if (key !== 'today') {
+        dailyUsage.push({
+          date: dateKey,
+          tokens: typeof accountValue === 'string' ? accountValue : accountDay.toString(),
+          source: 'account'
+        })
+      }
       continue
     }
-    const localForDay = sumModels(aggregateDailyModels(state, new Set([dateKey]))).total
-    authoritativeTokens += localForDay
-    if (localForDay > 0n) usedLocal = true
+
+    const localModels = aggregateDailyModels(state, new Set([dateKey]))
+    const localForDay = sumModels(localModels).total
+    const hasLocalAggregate = Object.keys(localModels).length > 0
+    if (hasLocalAggregate) {
+      authoritativeTokens += localForDay
+      usedLocal = true
+      if (key !== 'today') dailyUsage.push({ date: dateKey, tokens: localForDay.toString(), source: 'local' })
+    } else if (key !== 'today') {
+      dailyUsage.push({ date: dateKey, tokens: null, source: 'unavailable' })
+    } else {
+      // Today retains its legacy aggregate semantics: an absent account bucket
+      // contributes a zero local fallback even when no local event exists.
+      authoritativeTokens += localForDay
+    }
     if (dateKey === today) liveAccountSyncPending = true
   }
 
@@ -167,14 +198,15 @@ export function buildPeriod(
   return {
     key,
     label: periodLabel(key),
-    startAt: formatHongKongIso(startMs),
+    startAt: formatHongKongIso(periodStartMs),
     endAt: formatHongKongIso(endMs),
     tokens: serializeTokens(localTokens),
     authoritativeTokens: authoritativeTokens.toString(),
     source,
     liveAccountSyncPending,
     cost,
-    models: modelSummaries
+    models: modelSummaries,
+    ...(key !== 'today' ? { dailyUsage } : {})
   }
 }
 
@@ -245,6 +277,43 @@ export function estimateCapacity(cycles: AggregatedCycle[], current: AggregatedC
   }
 }
 
+function estimateCurrentCapacity(current: AggregatedCycle | null, usedPercent: number | null): CapacityEstimate {
+  const unavailable: CapacityEstimate = {
+    lowerTokens: null,
+    medianTokens: null,
+    upperTokens: null,
+    projectedTokens: null,
+    basisUsedPercent: null,
+    confidence: 'none',
+    sampleCount: 0,
+    explanation: 'No current reset-cycle token sample is available.'
+  }
+  if (!current || usedPercent === null || !Number.isFinite(usedPercent) || usedPercent <= 0 || usedPercent > 100) {
+    return unavailable
+  }
+
+  const currentTokens = sumModels(current.models).total
+  if (currentTokens <= 0n) return unavailable
+
+  const usedMilliPercent = Math.round(usedPercent * 1_000)
+  if (!Number.isSafeInteger(usedMilliPercent) || usedMilliPercent <= 0 || usedMilliPercent > 100_000) {
+    return unavailable
+  }
+
+  const denominator = BigInt(usedMilliPercent)
+  const projectedTokens = (currentTokens * 100_000n + denominator / 2n) / denominator
+  return {
+    lowerTokens: null,
+    medianTokens: null,
+    upperTokens: null,
+    projectedTokens: projectedTokens.toString(),
+    basisUsedPercent: usedPercent,
+    confidence: usedPercent < 15 ? 'low' : 'medium',
+    sampleCount: 1,
+    explanation: 'Current reset-cycle raw-token projection at the observed usage percentage.'
+  }
+}
+
 export function estimateQuotaProjection(
   usedPercent: number | null,
   startsAtMs: number | null,
@@ -291,6 +360,66 @@ export function estimateQuotaProjection(
   return { status, projectedUsedPercent }
 }
 
+function unavailableCurrentWeekEstimate(
+  lowerBound = false,
+  basisUsedPercent: number | null = null,
+  priceCoveragePercent: number | null = null
+): CurrentWeekEstimate {
+  return {
+    observedMicroUsd: null,
+    estimatedTotalMicroUsd: null,
+    estimatedRemainingMicroUsd: null,
+    priceCoveragePercent,
+    basisUsedPercent,
+    lowerBound
+  }
+}
+
+function estimateCurrentWeekApiEquivalent(
+  current: AggregatedCycle | null,
+  usedPercent: number | null,
+  priceBook: StoredPriceBook,
+  pricingLedger: PersistentState['pricingLedger']
+): CurrentWeekEstimate {
+  if (!current || usedPercent === null || !Number.isFinite(usedPercent) || usedPercent <= 0 || usedPercent > 100) {
+    return unavailableCurrentWeekEstimate()
+  }
+
+  const { cost, attoUsd } = calculateCostSummary(current.models, null, priceBook, pricingLedger, current.pricingSegments ?? [])
+  const lowerBound = cost.lowerBound === true
+  if (cost.pricedTokens === '0' || attoUsd <= 0n) {
+    return unavailableCurrentWeekEstimate(lowerBound, usedPercent, currentTokensPriceCoverage(current, cost.priceCoveragePercent ?? null))
+  }
+
+  const usedMilliPercent = Math.round(usedPercent * 1_000)
+  if (!Number.isSafeInteger(usedMilliPercent) || usedMilliPercent <= 0) {
+    return unavailableCurrentWeekEstimate(lowerBound, usedPercent, currentTokensPriceCoverage(current, cost.priceCoveragePercent ?? null))
+  }
+
+  const observedMicroUsd = roundAttoUsdToMicroUsd(attoUsd)
+  // usedPercent is represented in thousandths of a percent. Scale by
+  // 100 / usedPercent with integer round-half-up, keeping all monetary math
+  // in BigInt and avoiding floating point drift for large totals.
+  const scaleDenominator = BigInt(usedMilliPercent)
+  const scaleNumerator = 100_000n
+  const estimatedTotalAtto = (attoUsd * scaleNumerator + scaleDenominator / 2n) / scaleDenominator
+  const estimatedTotal = roundAttoUsdToMicroUsd(estimatedTotalAtto)
+  const estimatedRemaining = estimatedTotal >= observedMicroUsd ? estimatedTotal - observedMicroUsd : 0n
+
+  return {
+    observedMicroUsd: observedMicroUsd.toString(),
+    estimatedTotalMicroUsd: estimatedTotal.toString(),
+    estimatedRemainingMicroUsd: estimatedRemaining.toString(),
+    priceCoveragePercent: cost.priceCoveragePercent ?? null,
+    basisUsedPercent: usedPercent,
+    lowerBound
+  }
+}
+
+function currentTokensPriceCoverage(current: AggregatedCycle, coverage: number | null): number | null {
+  return sumModels(current.models).total > 0n ? coverage ?? 0 : null
+}
+
 function buildResetSummary(
   state: PersistentState,
   rateLimits: RateLimitBucket[],
@@ -306,18 +435,37 @@ function buildResetSummary(
       resetsAt: null,
       tokensSinceReset: serializeTokens(zeroTokens()),
       projection: estimateQuotaProjection(null, null, null, nowMs),
-      capacity: estimateCapacity(aggregateCycles(state), null)
+      capacity: estimateCurrentCapacity(null, null),
+      currentWeekEstimate: unavailableCurrentWeekEstimate()
+    }
+  }
+
+  const bounds = resetWindowBounds(window)
+  if (!bounds || !Number.isFinite(nowMs) || nowMs < bounds.startMs || nowMs >= bounds.resetMs) {
+    return {
+      limitId: main.limitId,
+      usedPercent: Number.isFinite(window.usedPercent) ? window.usedPercent : null,
+      startsAt: bounds ? new Date(bounds.startMs).toISOString() : null,
+      resetsAt: bounds ? new Date(bounds.resetMs).toISOString() : null,
+      tokensSinceReset: serializeTokens(zeroTokens()),
+      projection: estimateQuotaProjection(null, null, null, nowMs),
+      capacity: estimateCurrentCapacity(null, null),
+      currentWeekEstimate: unavailableCurrentWeekEstimate()
     }
   }
 
   const cycles = aggregateCycles(state)
   const current =
-    cycles.find(
-      (cycle) => cycle.limitId === main.limitId && cycle.resetsAt === Math.trunc(window.resetsAt)
-    ) ?? null
+    findCurrentCycle(cycles, main.limitId, window)
+  const currentWeekEstimate = estimateCurrentWeekApiEquivalent(
+    current,
+    window.usedPercent,
+    state.priceBook,
+    state.pricingLedger
+  )
   const tokens = current ? sumModels(current.models) : zeroTokens()
-  const resetMs = Math.trunc(window.resetsAt) * 1_000
-  const startMs = resetMs - window.windowDurationMins * 60 * 1_000
+  const resetMs = bounds.resetMs
+  const startMs = bounds.startMs
 
   return {
     limitId: main.limitId,
@@ -326,8 +474,21 @@ function buildResetSummary(
     resetsAt: new Date(resetMs).toISOString(),
     tokensSinceReset: serializeTokens(tokens),
     projection: estimateQuotaProjection(window.usedPercent, startMs, resetMs, nowMs),
-    capacity: estimateCapacity(cycles, current)
+    capacity: estimateCurrentCapacity(current, window.usedPercent),
+    currentWeekEstimate
   }
+}
+
+function resetWindowBounds(window: RateLimitWindow): { startMs: number; resetMs: number } | null {
+  if (
+    !Number.isFinite(window.resetsAt) ||
+    !Number.isFinite(window.windowDurationMins) ||
+    window.windowDurationMins <= 0
+  ) return null
+  const resetMs = Math.trunc(window.resetsAt) * 1_000
+  const startMs = resetMs - window.windowDurationMins * 60 * 1_000
+  if (!Number.isFinite(resetMs) || !Number.isFinite(startMs) || startMs > resetMs) return null
+  return { startMs, resetMs }
 }
 
 function aggregateDailyModels(state: PersistentState, dates: Set<string>): ModelsBig {
@@ -379,35 +540,160 @@ function materializeStoredModel(stored: StoredModelAggregate): ModelAggregateSli
   return aggregate
 }
 
+function findCurrentCycle(
+  cycles: AggregatedCycle[],
+  limitId: string,
+  window: RateLimitWindow
+): AggregatedCycle | null {
+  const targetReset = Math.trunc(window.resetsAt)
+  const matching = cycles
+    .filter(
+      (cycle) =>
+        cycle.limitId === limitId &&
+        cycle.windowDurationMins === window.windowDurationMins &&
+        Math.abs(cycle.resetsAt - targetReset) <= RESET_DRIFT_TOLERANCE_SECONDS
+    )
+    .sort((left, right) => {
+      const distance = Math.abs(left.resetsAt - targetReset) - Math.abs(right.resetsAt - targetReset)
+      return distance !== 0 ? distance : right.resetsAt - left.resetsAt
+    })
+  return matching[0] ?? null
+}
+
 function aggregateCycles(state: PersistentState): AggregatedCycle[] {
   const cycles = new Map<string, AggregatedCycle>()
   for (const session of Object.values(state.sessions)) {
     for (const [key, stored] of Object.entries(session.legacyCycles ?? {})) {
-      const cycle = cycles.get(key) ?? {
-        limitId: stored.limitId,
-        resetsAt: stored.resetsAt,
-        windowDurationMins: stored.windowDurationMins,
-        models: {},
-        usedPercents: new Set<number>()
-      }
+      const mapKey = `${key}:${stored.windowDurationMins}`
+      const cycle = cycles.get(mapKey) ?? createAggregatedCycle(stored)
       mergeStoredModels(cycle.models, stored.models, true)
+      appendStoredCycleSegments(cycle.pricingSegments ?? (cycle.pricingSegments = []), stored.models, true)
       for (const percent of stored.usedPercents) cycle.usedPercents.add(percent)
-      cycles.set(key, cycle)
+      cycles.set(mapKey, cycle)
     }
     for (const [key, stored] of Object.entries(session.cycles)) {
-      const cycle = cycles.get(key) ?? {
-        limitId: stored.limitId,
-        resetsAt: stored.resetsAt,
-        windowDurationMins: stored.windowDurationMins,
-        models: {},
-        usedPercents: new Set<number>()
-      }
-      mergeStoredModels(cycle.models, stored.models, session.legacyUnpriced === true && !session.legacyCycles)
+      const mapKey = `${key}:${stored.windowDurationMins}`
+      const cycle = cycles.get(mapKey) ?? createAggregatedCycle(stored)
+      const legacy = session.legacyUnpriced === true && !session.legacyCycles
+      mergeStoredModels(cycle.models, stored.models, legacy)
+      appendStoredCycleSegments(cycle.pricingSegments ?? (cycle.pricingSegments = []), stored.models, legacy)
       for (const percent of stored.usedPercents) cycle.usedPercents.add(percent)
-      cycles.set(key, cycle)
+      cycles.set(mapKey, cycle)
     }
   }
-  return [...cycles.values()]
+  return coalesceResetDrift([...cycles.values()])
+}
+
+function createAggregatedCycle(stored: StoredCycleAggregate): AggregatedCycle {
+  return {
+    limitId: stored.limitId,
+    resetsAt: Math.trunc(stored.resetsAt),
+    windowDurationMins: stored.windowDurationMins,
+    models: {},
+    pricingSegments: [],
+    usedPercents: new Set<number>()
+  }
+}
+
+function coalesceResetDrift(cycles: AggregatedCycle[]): AggregatedCycle[] {
+  const grouped = new Map<string, AggregatedCycle[]>()
+  for (const cycle of cycles) {
+    const key = `${cycle.limitId}:${cycle.windowDurationMins}`
+    const group = grouped.get(key) ?? []
+    group.push(cycle)
+    grouped.set(key, group)
+  }
+
+  const result: AggregatedCycle[] = []
+  for (const group of grouped.values()) {
+    group.sort((left, right) => left.resetsAt - right.resetsAt)
+    let current: AggregatedCycle | null = null
+    let groupStartReset = 0
+    for (const cycle of group) {
+      if (!current || cycle.resetsAt - groupStartReset > RESET_DRIFT_TOLERANCE_SECONDS) {
+        current = {
+          limitId: cycle.limitId,
+          resetsAt: cycle.resetsAt,
+          windowDurationMins: cycle.windowDurationMins,
+          models: {},
+          pricingSegments: [],
+          usedPercents: new Set<number>()
+        }
+        groupStartReset = cycle.resetsAt
+        result.push(current)
+      }
+      mergeAggregatedCycle(current, cycle)
+      current.resetsAt = Math.max(current.resetsAt, cycle.resetsAt)
+    }
+  }
+  return result
+}
+
+function mergeAggregatedCycle(target: AggregatedCycle, source: AggregatedCycle): void {
+  for (const [model, sourceUsage] of Object.entries(source.models)) {
+    const targetUsage = (target.models[model] ??= createModelAggregate())
+    mergeModelAggregate(targetUsage, sourceUsage)
+  }
+  target.pricingSegments!.push(...source.pricingSegments ?? [])
+  for (const percent of source.usedPercents) target.usedPercents.add(percent)
+}
+
+function appendStoredCycleSegments(
+  target: PricingSegment[],
+  source: Record<string, StoredModelAggregate>,
+  legacy: boolean
+): void {
+  for (const [model, stored] of Object.entries(source)) {
+    target.push({ model, usage: materializeStoredModel(stored), legacy })
+  }
+}
+
+function createModelAggregate(): ModelAggregateBig {
+  return {
+    short: zeroTokens(),
+    long: zeroTokens(),
+    unknown: zeroTokens(),
+    eventCount: 0,
+    bySpeed: {}
+  }
+}
+
+function mergeModelAggregate(target: ModelAggregateBig, source: ModelAggregateBig): void {
+  mergeModelSlice(target, source)
+  if (!source.legacy) return
+  const legacy = (target.legacy ??= {
+    short: zeroTokens(),
+    long: zeroTokens(),
+    unknown: zeroTokens(),
+    eventCount: 0,
+    bySpeed: {}
+  })
+  mergeModelSlice(legacy, source.legacy)
+}
+
+function mergeModelSlice(target: ModelAggregateSlice, source: ModelAggregateSlice): void {
+  target.short = addTokens(target.short, source.short)
+  target.long = addTokens(target.long, source.long)
+  target.unknown = addTokens(target.unknown ?? zeroTokens(), source.unknown ?? zeroTokens())
+  target.eventCount += source.eventCount
+  target.firstEventAt = minIso(target.firstEventAt, source.firstEventAt)
+  target.lastEventAt = maxIso(target.lastEventAt, source.lastEventAt)
+  const targetBySpeed = (target.bySpeed ??= {})
+  for (const [speed, sourceSpeed] of Object.entries(source.bySpeed ?? {})) {
+    if (!sourceSpeed || !isServiceTier(speed)) continue
+    const targetSpeed = (targetBySpeed[speed] ??= {
+      short: zeroTokens(),
+      long: zeroTokens(),
+      unknown: zeroTokens(),
+      eventCount: 0
+    })
+    targetSpeed.short = addTokens(targetSpeed.short, sourceSpeed.short)
+    targetSpeed.long = addTokens(targetSpeed.long, sourceSpeed.long)
+    targetSpeed.unknown = addTokens(targetSpeed.unknown ?? zeroTokens(), sourceSpeed.unknown ?? zeroTokens())
+    targetSpeed.eventCount += sourceSpeed.eventCount
+    targetSpeed.firstEventAt = minIso(targetSpeed.firstEventAt, sourceSpeed.firstEventAt)
+    targetSpeed.lastEventAt = maxIso(targetSpeed.lastEventAt, sourceSpeed.lastEventAt)
+  }
 }
 
 function mergeStoredModels(target: ModelsBig, source: Record<string, StoredModelAggregate>, legacyUnpriced = false): void {
@@ -483,6 +769,7 @@ function calculateCostSummary(
 ): {
   cost: PeriodSummary['cost']
   modelSummaries: ModelUsageSummary[]
+  attoUsd: bigint
 } {
   let totalAttoUsd = 0n
   let totalPricedTokens = 0n
@@ -525,6 +812,13 @@ function calculateCostSummary(
         ]
     for (const segment of segments) {
       const segmentUsage = segment.usage
+      // Persisted cycle/model aggregates retain only endpoint timestamps. If
+      // those endpoints resolve to different pricing facts, the indivisible
+      // segment cannot be split safely; fail the whole segment closed instead
+      // of applying the earliest rate to every token. Changes that occur and
+      // revert inside one persisted segment remain unobservable at this
+      // granularity and are therefore a documented residual limitation.
+      const segmentStable = segment.legacy || isPricingSegmentStable(segment, priceBook, pricingLedger)
       const bySpeed = segmentUsage.bySpeed && Object.keys(segmentUsage.bySpeed).length > 0
         ? segmentUsage.bySpeed
         : { standard: { short: segmentUsage.short, long: segmentUsage.long, unknown: segmentUsage.unknown, eventCount: segmentUsage.eventCount } }
@@ -534,7 +828,7 @@ function calculateCostSummary(
         const speedUnknown = speedUsage.unknown ?? zeroTokens()
         const speedTokens = addTokens(addTokens(speedUsage.short, speedUsage.long), speedUnknown)
         const eventAt = speedUsage.firstEventAt ?? segmentUsage.firstEventAt ?? priceBook.updatedAt
-        const effective = segment.legacy
+        const effective = segment.legacy || !segmentStable
           ? null
           : resolveEffectiveModelPricing(priceBook, model, eventAt, pricingLedger)
         const selectedPrice = effective?.hasEffectiveBase ? effective.price : undefined
@@ -558,7 +852,7 @@ function calculateCostSummary(
         const speedUnpricedTokens = (result.unpricedTokens ?? 0n) + unknownContextTokens
         const missingBase = !segment.legacy && !effective?.hasEffectiveBase
         const missingLong = !segment.legacy && speedUsage.long.total > 0n && !effective?.hasEffectiveLong
-        const speedLowerBound = result.lowerBound === true || isUnknownSpeed || unknownContextTokens > 0n || segment.legacy || missingBase || missingLong
+        const speedLowerBound = result.lowerBound === true || speedUnpricedTokens > 0n || isUnknownSpeed || unknownContextTokens > 0n || segment.legacy || missingBase || missingLong
         if (result.pricedTokens > 0n && selectedPrice) {
           summaryPrice ??= selectedPrice
           if (baseIdentity) summaryBaseIdentities.add(baseIdentity)
@@ -620,6 +914,7 @@ function calculateCostSummary(
   const fastRateCoveragePercent = recordedFastTokens > 0n ? percent(verifiedFastTokens, recordedFastTokens) : null
 
   return {
+    attoUsd: totalAttoUsd,
     cost: {
       microUsd: totalPricedTokens > 0n ? roundAttoUsdToMicroUsd(totalAttoUsd).toString() : null,
       coveragePercent,
@@ -663,6 +958,78 @@ function pricingBaseIdentity(price: StoredModelPrice): string | null {
   })
 }
 
+function isPricingSegmentStable(
+  segment: PricingSegment,
+  priceBook: StoredPriceBook,
+  pricingLedger: PersistentState['pricingLedger']
+): boolean {
+  const usage = segment.usage
+  const bySpeed = usage.bySpeed && Object.keys(usage.bySpeed).length > 0
+    ? usage.bySpeed
+    : { standard: { short: usage.short, long: usage.long, unknown: usage.unknown, eventCount: usage.eventCount, firstEventAt: usage.firstEventAt, lastEventAt: usage.lastEventAt } }
+  for (const speed of ['standard', 'fast', 'unknown'] as const) {
+    const speedUsage = bySpeed[speed]
+    if (!speedUsage) continue
+    const firstEventAt = speedUsage.firstEventAt ?? usage.firstEventAt ?? priceBook.updatedAt
+    const lastEventAt = speedUsage.lastEventAt ?? usage.lastEventAt ?? firstEventAt
+    const first = resolveEffectiveModelPricing(priceBook, segment.model, firstEventAt, pricingLedger)
+    const last = resolveEffectiveModelPricing(priceBook, segment.model, lastEventAt, pricingLedger)
+    if (effectivePricingIdentity(first, speed) !== effectivePricingIdentity(last, speed)) return false
+  }
+  return true
+}
+
+function effectivePricingIdentity(
+  effective: ReturnType<typeof resolveEffectiveModelPricing>,
+  speed: ServiceTier
+): string {
+  const price = effective.price
+  const fast = speed === 'fast' && effective.fastFact
+    ? {
+        model: effective.fastFact.model,
+        numerator: effective.fastFact.numerator,
+        denominator: effective.fastFact.denominator,
+        source: pricingComponentIdentity(effective.fastFact.source)
+      }
+    : null
+  return JSON.stringify({
+    resolvedKey: effective.resolvedKey ?? null,
+    hasEffectiveBase: effective.hasEffectiveBase,
+    hasEffectiveLong: effective.hasEffectiveLong,
+    longContextThreshold: effective.longContextThreshold?.toString() ?? null,
+    short: pricingSetIdentity(price?.short ?? null),
+    long: pricingSetIdentity(price?.long ?? null),
+    base: pricingComponentIdentity(price?.base),
+    longComponent: pricingComponentIdentity(price?.longComponent),
+    fast
+  })
+}
+
+function pricingSetIdentity(value: StoredModelPrice['short'] | null): Record<string, string | null> | null {
+  if (!value) return null
+  return {
+    input: value.inputMicroUsdPerMillion,
+    cachedInput: value.cachedInputMicroUsdPerMillion,
+    cacheWriteInput: value.cacheWriteMicroUsdPerMillion,
+    output: value.outputMicroUsdPerMillion
+  }
+}
+
+function pricingComponentIdentity(
+  value: NonNullable<StoredModelPrice['base']> | undefined
+): Record<string, string | null> | null {
+  if (!value) return null
+  return {
+    componentId: value.componentId,
+    source: value.source,
+    sourceUrl: value.sourceUrl,
+    sourceSha256: value.sourceSha256,
+    sourceCommit: value.sourceCommit,
+    effectiveAt: value.effectiveAt,
+    quality: value.quality
+  }
+}
+
 function removeTukeyOutliers(sorted: bigint[]): bigint[] {
   const q1 = quantile(sorted, 0.25)
   const q3 = quantile(sorted, 0.75)
@@ -680,8 +1047,8 @@ function quantile(sorted: bigint[], percentile: number): bigint {
 
 function periodLabel(key: PeriodKey): string {
   if (key === 'today') return 'Today'
-  if (key === 'week') return 'This week'
-  return 'This month'
+  if (key === 'week') return 'Last 7 days'
+  return 'Last 30 days'
 }
 
 function safeBigInt(value: string): bigint {
@@ -689,6 +1056,15 @@ function safeBigInt(value: string): bigint {
     return BigInt(value)
   } catch {
     return 0n
+  }
+}
+
+function parseNonNegativeTokenCount(value: unknown): bigint | null {
+  if (typeof value !== 'string' || !/^\d+$/u.test(value)) return null
+  try {
+    return BigInt(value)
+  } catch {
+    return null
   }
 }
 

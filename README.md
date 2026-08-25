@@ -4,10 +4,12 @@ A compact Windows overlay that shows account-level Codex token activity, local i
 
 ## What it shows
 
-- Today, Monday-to-now week, and current month totals in `Asia/Hong_Kong`.
+- Today, rolling 7 Days, and rolling 30 Days totals in `Asia/Hong_Kong`.
+- Daily token trend charts for rolling 7/30 Days with Account-first/local-fallback attribution and explicit unavailable gaps.
 - The current Codex usage percentage, exact reset time, and tokens observed since the reset.
 - A current-week pace projection showing whether quota is likely to run out before the next reset and the projected usage percentage at reset.
-- An empirical weekly raw-token capacity range based on the current and up to eight recent valid reset cycles.
+- A current-reset-week projected weekly token capacity based only on tokens observed and the current reset percentage.
+- An estimated weekly API-equivalent total and remaining cost based only on the current reset cycle, with priced coverage, usage basis, and lower-bound status.
 - Token-only API-equivalent cost using the latest available OpenAI Standard rates, with an explicit coverage percentage.
 
 Account daily totals come from the read-only Codex App Server methods `account/usage/read` and `account/rateLimits/read`. Current-day and input/cached/output detail are derived read-only from local Codex session JSONL files. The app never reads or stores OAuth/API secrets and never changes Codex sessions.
@@ -40,4 +42,6 @@ The NSIS installer is written to `release/`. The local build is unsigned, so Win
 - Every displayed price carries source URL, source or payload SHA, component effective/observed time, quality, freshness/error state, and coverage. Cache-write tokens with no explicit source rate remain unpriced rather than receiving a synthetic multiplier.
 - USD values are API-equivalent estimates, never a subscription invoice or a user-configurable price override. Persisted state uses v2 generation files with an atomic checksum manifest and retains a v1 legacy fallback during migration.
 - The quota projection linearly extrapolates the current reset week's average percentage-consumption pace. It is an estimate, not a guarantee, and can change as usage changes.
-- Codex limits are weighted and model-dependent. The displayed weekly token capacity is an empirical range, not a published fixed token cap.
+- The weekly API-equivalent estimate uses only priced tokens observed in the current reset cycle and scales that cost by the current reset-window percentage. Historical cycles and account-token totals never affect it; missing pricing, zero/invalid usage, and incomplete coverage are shown as `N/A` or lower bounds.
+- The displayed weekly token capacity is a current-cycle projection, not a published fixed token cap; it reports low confidence below 15% usage and medium confidence thereafter. Historical cycles remain available for compatibility but do not affect displayed token or USD estimates.
+- Persisted cycle/model pricing slices retain endpoint timestamps. If the endpoints resolve to different base, long-context, or Fast pricing facts, that indivisible slice is shown as an unpriced lower bound; a revision that changes and reverts between the endpoints cannot be recovered without raw replay.

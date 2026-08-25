@@ -55,6 +55,18 @@ export interface CostSummary {
   }>
 }
 
+export type DailyUsageSource = 'account' | 'local' | 'unavailable'
+
+interface DailyUsagePointBase {
+  /** HKT calendar date in YYYY-MM-DD form. */
+  date: string
+}
+
+export type DailyUsagePoint =
+  | (DailyUsagePointBase & { source: 'account'; tokens: string })
+  | (DailyUsagePointBase & { source: 'local'; tokens: string })
+  | (DailyUsagePointBase & { source: 'unavailable'; tokens: null })
+
 export interface PricingComponentSummary {
   componentId: string
   source: string
@@ -81,6 +93,8 @@ export interface PeriodSummary {
   liveAccountSyncPending: boolean
   cost: CostSummary
   models: ModelUsageSummary[]
+  /** Present for rolling week/month periods; omitted for legacy Today callers. */
+  dailyUsage?: DailyUsagePoint[]
 }
 
 export interface RateLimitWindow {
@@ -102,6 +116,10 @@ export interface CapacityEstimate {
   lowerTokens: string | null
   medianTokens: string | null
   upperTokens: string | null
+  /** Current-reset-cycle-only projection; absent for legacy range callers. */
+  projectedTokens?: string | null
+  /** Reset-window percentage used for the current-cycle projection. */
+  basisUsedPercent?: number | null
   confidence: Confidence
   sampleCount: number
   explanation: string
@@ -112,6 +130,21 @@ export interface QuotaProjection {
   projectedUsedPercent: number | null
 }
 
+export interface CurrentWeekEstimate {
+  /** Priced API-equivalent cost observed in the current reset cycle. */
+  observedMicroUsd: string | null
+  /** Round-half-up extrapolation of the observed cost to 100% of the cycle. */
+  estimatedTotalMicroUsd: string | null
+  /** Estimated total less the observed priced cost. */
+  estimatedRemainingMicroUsd: string | null
+  /** Priced local-cycle cost as a percentage of local-cycle tokens. */
+  priceCoveragePercent: number | null
+  /** Reset-window percentage used as the extrapolation basis. */
+  basisUsedPercent: number | null
+  /** True when the priced result is incomplete or otherwise a lower bound. */
+  lowerBound: boolean
+}
+
 export interface ResetSummary {
   limitId: string | null
   usedPercent: number | null
@@ -120,6 +153,7 @@ export interface ResetSummary {
   tokensSinceReset: TokenBreakdown
   projection: QuotaProjection
   capacity: CapacityEstimate
+  currentWeekEstimate: CurrentWeekEstimate
 }
 
 export interface FreshnessStatus {

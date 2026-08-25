@@ -11,8 +11,9 @@ import {
   Sparkles,
   X
 } from 'lucide-react'
-import type { DashboardSnapshot, PeriodKey, QuotaProjection, TokenBreakdown } from '../shared/contracts'
+import type { DashboardSnapshot, DailyUsagePoint, PeriodKey, QuotaProjection, TokenBreakdown } from '../shared/contracts'
 import { formatProjectedPercent } from '../shared/quota-projection'
+import { buildTrendChartModel, formatTrendTooltip, trendSourceLabel } from '../shared/trend'
 import {
   formatCountdown,
   formatExactTokens,
@@ -147,7 +148,7 @@ export function App(): ReactElement {
             className={periodKey === key ? 'active' : ''}
             onClick={() => setPeriodKey(key)}
           >
-            {key === 'today' ? 'Today' : key === 'week' ? 'Week' : 'Month'}
+            {key === 'today' ? 'Today' : key === 'week' ? '7 Days' : '30 Days'}
           </button>
         ))}
       </nav>
@@ -190,6 +191,7 @@ export function App(): ReactElement {
         </div>
         <QuotaProjectionRow projection={snapshot.reset.projection} />
         <CapacityRange snapshot={snapshot} />
+        <CurrentWeekEstimate estimate={snapshot.reset.currentWeekEstimate} />
       </section>
 
       {additionalLimits.length > 0 && (
@@ -221,6 +223,8 @@ export function App(): ReactElement {
         )}
       </section>
 
+      {periodKey !== 'today' && <TokenUseTrend points={period.dailyUsage ?? []} periodKey={periodKey} />}
+
       <PricingDetails period={period} snapshot={snapshot} />
 
       <footer className="app-footer">
@@ -232,6 +236,98 @@ export function App(): ReactElement {
         </div>
       </footer>
     </main>
+  )
+}
+
+function TokenUseTrend({
+  points,
+  periodKey
+}: {
+  points: DailyUsagePoint[]
+  periodKey: Exclude<PeriodKey, 'today'>
+}): ReactElement {
+  const [activeIndex, setActiveIndex] = useState<number | null>(null)
+  const chart = buildTrendChartModel(points)
+  const dayCount = periodKey === 'week' ? 7 : 30
+  const activePoint = activeIndex === null ? null : chart.points[activeIndex] ?? null
+
+  const showPoint = (index: number): void => setActiveIndex(index)
+  const hidePoint = (): void => setActiveIndex(null)
+
+  return (
+    <section className="trend-card" aria-labelledby="token-use-trend-title">
+      <div className="section-heading compact">
+        <span className="eyebrow" id="token-use-trend-title">TOKEN USE TREND</span>
+        <span>LAST {dayCount} DAYS</span>
+      </div>
+      <p className="trend-subtitle">Daily total · Account first, local fallback · HKT</p>
+      {!chart.hasData ? (
+        <p className="trend-empty" role="status">Data unavailable for this period.</p>
+      ) : (
+        <div className="trend-chart-wrap">
+          <svg
+            className="trend-chart"
+            viewBox={`0 0 ${chart.width} ${chart.height}`}
+            role="img"
+            aria-label={`Daily token use for the last ${dayCount} days`}
+          >
+            <line
+              className="trend-zero-line"
+              x1={chart.left}
+              x2={chart.width - chart.right}
+              y1={chart.baseline}
+              y2={chart.baseline}
+            />
+            {chart.segments.map((segment, index) => (
+              <g key={`trend-segment-${index}`}>
+                {segment.areaPath && <path className="trend-area" d={segment.areaPath} />}
+                <path className="trend-line" d={segment.linePath} />
+              </g>
+            ))}
+            {chart.points.map((point, index) => (
+              <circle
+                key={point.raw.date}
+                className={`trend-point${point.available ? '' : ' trend-point--unavailable'}`}
+                cx={point.x}
+                cy={point.y}
+                r={point.available ? 2.75 : 3}
+                tabIndex={0}
+                role="button"
+                aria-label={formatTrendTooltip(point.raw)}
+                onPointerEnter={() => showPoint(index)}
+                onPointerMove={() => showPoint(index)}
+                onPointerLeave={hidePoint}
+                onFocus={() => showPoint(index)}
+                onBlur={hidePoint}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault()
+                    showPoint(index)
+                  }
+                }}
+              >
+                <title>{formatTrendTooltip(point.raw)}</title>
+              </circle>
+            ))}
+            {chart.labels.map((label) => (
+              <text key={`${label.index}-${label.text}`} className="trend-axis-label" x={label.x} y={chart.height - 8} textAnchor={label.anchor}>
+                {label.text}
+              </text>
+            ))}
+          </svg>
+          {activePoint && (
+            <div className="trend-tooltip" role="status" aria-live="polite">
+              <strong>{activePoint.raw.date} HKT</strong>
+              <span>
+                {activePoint.raw.source === 'unavailable'
+                  ? 'Data unavailable'
+                  : `${activePoint.raw.tokens} tokens · ${trendSourceLabel(activePoint.raw.source)}`}
+              </span>
+            </div>
+          )}
+        </div>
+      )}
+    </section>
   )
 }
 
@@ -325,21 +421,43 @@ function collapsedProjectionCopy(projection: QuotaProjection): string {
 
 function CapacityRange({ snapshot }: { snapshot: DashboardSnapshot }): ReactElement {
   const estimate = snapshot.reset.capacity
-  if (!estimate.lowerTokens || !estimate.upperTokens) {
+  if (!estimate.projectedTokens) {
     return (
       <div className="capacity-row muted">
-        <span>Estimated weekly capacity</span>
-        <strong>Learning your usage mix…</strong>
+        <span>Estimated weekly token capacity</span>
+        <strong>N/A</strong>
       </div>
     )
   }
+  const basis = estimate.basisUsedPercent === null || estimate.basisUsedPercent === undefined
+    ? 'N/A basis'
+    : `${estimate.basisUsedPercent.toFixed(1)}% basis`
   return (
     <div className="capacity-row">
-      <span>Estimated weekly capacity</span>
-      <strong>{formatTokens(estimate.lowerTokens)}–{formatTokens(estimate.upperTokens)}</strong>
+      <span>Estimated weekly token capacity</span>
+      <strong>{formatTokens(estimate.projectedTokens)}</strong>
       <small>
-        Median {estimate.medianTokens ? formatTokens(estimate.medianTokens) : 'N/A'} · {estimate.confidence} confidence · {estimate.sampleCount} cycle{estimate.sampleCount === 1 ? '' : 's'}
+        Current reset week · {basis} · {estimate.confidence} confidence
       </small>
+    </div>
+  )
+}
+
+function CurrentWeekEstimate({ estimate }: { estimate: DashboardSnapshot['reset']['currentWeekEstimate'] }): ReactElement {
+  const basis = estimate.basisUsedPercent === null ? 'N/A' : `${estimate.basisUsedPercent.toFixed(1)}% used`
+  const coverage = estimate.priceCoveragePercent === null ? 'N/A' : `${estimate.priceCoveragePercent.toFixed(1)}% priced coverage`
+  const bound = estimate.lowerBound ? ' · lower bound' : ''
+  return (
+    <div className={`api-equivalent-row${estimate.lowerBound ? ' api-equivalent-row--lower-bound' : ''}`}>
+      <div className="api-equivalent-heading">
+        <span>Estimated weekly API-equivalent</span>
+        <strong>{formatMicroUsd(estimate.estimatedTotalMicroUsd)}</strong>
+      </div>
+      <div className="api-equivalent-remaining">
+        <span>Remaining</span>
+        <strong>{formatMicroUsd(estimate.estimatedRemainingMicroUsd)}</strong>
+      </div>
+      <small>Current reset week basis · {basis} · {coverage}{bound}</small>
     </div>
   )
 }
