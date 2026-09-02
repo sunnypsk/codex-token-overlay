@@ -223,6 +223,7 @@ export class StateStore {
   private saving: Promise<void> | null = null
   private mutationRevision = 0
   private durableRevision = -1
+  private durableStateFingerprint: string | null = null
   private readonly generationDirectory: string
   private readonly manifestPath: string
   private readonly legacyFallback: boolean
@@ -239,7 +240,7 @@ export class StateStore {
       const parsed = await this.readGeneration(candidate)
       if (parsed) {
         this.state = await mergeLegacyV1Fallback(parsed, this.filePath)
-        this.resetDurabilityTracking()
+        this.resetDurabilityTracking(fingerprintDurableState(parsed))
         return this.state
       }
     }
@@ -301,13 +302,19 @@ export class StateStore {
       this.saveTimer = null
     }
     while (this.durableRevision < this.mutationRevision || this.durableRevision < 0) {
-      const targetRevision = this.mutationRevision
       if (this.saving) {
         await this.saving
         continue
       }
+      const targetRevision = this.mutationRevision
+      const targetContent = `${JSON.stringify({ ...this.state, version: 2 })}\n`
+      const targetFingerprint = fingerprintDurableState(this.state)
+      if (targetFingerprint === this.durableStateFingerprint) {
+        this.durableRevision = targetRevision
+        continue
+      }
       const previous = StateStore.locks.get(this.filePath) ?? Promise.resolve()
-      const write = previous.catch(() => undefined).then(() => this.writeGenerationAtomically())
+      const write = previous.catch(() => undefined).then(() => this.writeGenerationAtomically(targetContent))
       this.saving = write
       StateStore.locks.set(this.filePath, write)
       try {
@@ -316,6 +323,7 @@ export class StateStore {
         // the durable marker behind it so this same awaited save must create
         // and await a follow-up generation.
         this.durableRevision = targetRevision
+        this.durableStateFingerprint = targetFingerprint
       } finally {
         if (StateStore.locks.get(this.filePath) === write) StateStore.locks.delete(this.filePath)
         if (this.saving === write) this.saving = null
@@ -323,9 +331,10 @@ export class StateStore {
     }
   }
 
-  private resetDurabilityTracking(): void {
+  private resetDurabilityTracking(durableStateFingerprint: string | null = null): void {
     this.mutationRevision = 0
     this.durableRevision = -1
+    this.durableStateFingerprint = durableStateFingerprint
   }
 
   async readManifest(): Promise<PricingManifestPointer | null> {
@@ -360,9 +369,8 @@ export class StateStore {
     return null
   }
 
-  private async writeGenerationAtomically(): Promise<void> {
+  private async writeGenerationAtomically(content: string): Promise<void> {
     await mkdir(this.generationDirectory, { recursive: true })
-    const content = `${JSON.stringify({ ...this.state, version: 2 })}\n`
     const file = `usage-state-v2-${Date.now()}-${randomUUID()}.json`
     const generationPath = join(this.generationDirectory, file)
     await writeDurably(generationPath, content)
@@ -622,6 +630,20 @@ async function writeDurably(path: string, content: string): Promise<void> {
   } finally {
     await handle.close()
   }
+}
+
+function fingerprintDurableState(state: PersistentState): string {
+  // Successful polls and scans refresh these observation-only fields even when
+  // the durable usage projection is unchanged. Excluding them prevents the
+  // large generation file from being rewritten on every heartbeat. The latest
+  // values still ride along with the next substantive durable state change.
+  return sha256(JSON.stringify({
+    ...state,
+    account: { ...state.account, syncedAt: null },
+    rateLimitsSyncedAt: null,
+    localIndexedAt: null,
+    rebuild: { ...state.rebuild, processedFiles: 0 }
+  }))
 }
 
 async function pruneObsoleteGenerations(directory: string, keep: Set<string>): Promise<void> {

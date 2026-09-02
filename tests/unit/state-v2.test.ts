@@ -65,6 +65,56 @@ describe('state v2 generation persistence', () => {
     expect(await readFile(file, 'utf8')).toBe('legacy-untouched\n')
   })
 
+  it('skips generation writes for observation-only churn and persists the latest observations with real changes', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'codex-state-heartbeat-v2-'))
+    roots.push(root)
+    const file = join(root, 'usage-state.json')
+    const store = new StateStore(file)
+    await store.load()
+    store.update((state) => { state.settings.expanded = true })
+    await store.save()
+    const firstManifest = await store.readManifest()
+
+    store.update((state) => {
+      state.account.syncedAt = '2026-09-02T09:00:00.000Z'
+      state.rateLimitsSyncedAt = '2026-09-02T09:00:01.000Z'
+      state.localIndexedAt = '2026-09-02T09:00:02.000Z'
+      state.rebuild.processedFiles = 1
+    })
+    await store.save()
+    expect((await store.readManifest())?.active.file).toBe(firstManifest?.active.file)
+
+    store.update((state) => {
+      state.account.lifetimeTokens = '42'
+      state.localIndexedAt = '2026-09-02T09:00:03.000Z'
+    })
+    await store.save()
+    expect((await store.readManifest())?.active.file).not.toBe(firstManifest?.active.file)
+
+    const reloaded = new StateStore(file)
+    await reloaded.load()
+    expect(reloaded.get().account.lifetimeTokens).toBe('42')
+    expect(reloaded.get().account.syncedAt).toBe('2026-09-02T09:00:00.000Z')
+    expect(reloaded.get().rateLimitsSyncedAt).toBe('2026-09-02T09:00:01.000Z')
+    expect(reloaded.get().localIndexedAt).toBe('2026-09-02T09:00:03.000Z')
+    expect(reloaded.get().rebuild.processedFiles).toBe(1)
+  })
+
+  it('keeps the active generation stable across steady periodic index scans', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'codex-state-periodic-v2-'))
+    roots.push(root)
+    const store = new StateStore(join(root, 'usage-state.json'))
+    await store.load()
+    const indexer = new SessionIndexer(root, store, 0, () => undefined)
+
+    await indexer.scan('initial')
+    await indexer.scan('periodic')
+    const steadyManifest = await store.readManifest()
+    await indexer.scan('periodic')
+
+    expect((await store.readManifest())?.active.file).toBe(steadyManifest?.active.file)
+  })
+
   it('awaits a post-cutover generation when mutation lands during an in-flight save', async () => {
     const root = await mkdtemp(join(tmpdir(), 'codex-state-cutover-durability-v2-'))
     roots.push(root)
@@ -76,15 +126,15 @@ describe('state v2 generation persistence', () => {
     let started!: () => void
     const gate = new Promise<void>((resolve) => { releaseWrite = resolve })
     const firstWriteStarted = new Promise<void>((resolve) => { started = resolve })
-    const target = store as unknown as { writeGenerationAtomically: () => Promise<void> }
+    const target = store as unknown as { writeGenerationAtomically: (content: string) => Promise<void> }
     const original = target.writeGenerationAtomically.bind(store)
-    target.writeGenerationAtomically = async () => {
+    target.writeGenerationAtomically = async (content) => {
       writes += 1
       if (writes === 1) {
         started()
         await gate
       }
-      await original()
+      await original(content)
     }
 
     const firstSave = store.save()
@@ -109,6 +159,74 @@ describe('state v2 generation persistence', () => {
     expect(reloaded.get().rebuild.mode).toBe('background-replay')
     expect(reloaded.get().sessions.cutover?.sessionId).toBe('cutover')
     expect((await reloaded.readManifest())?.previous).toBeDefined()
+  })
+
+  it('writes the same captured state that produced the durable fingerprint across an ABA mutation', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'codex-state-aba-v2-'))
+    roots.push(root)
+    const file = join(root, 'usage-state.json')
+    const store = new StateStore(file)
+    await store.load()
+    await store.save()
+    const target = store as unknown as { writeGenerationAtomically: (content: string) => Promise<void> }
+    const original = target.writeGenerationAtomically.bind(store)
+    let writes = 0
+    target.writeGenerationAtomically = async (content) => {
+      writes += 1
+      if (writes === 1) {
+        store.update((state) => { state.settings.expanded = false })
+        await original(content)
+        store.update((state) => { state.settings.expanded = true })
+        return
+      }
+      await original(content)
+    }
+
+    store.update((state) => { state.settings.expanded = true })
+    await store.save()
+    await store.save()
+    target.writeGenerationAtomically = original
+    expect(writes).toBe(1)
+
+    const reloaded = new StateStore(file)
+    await reloaded.load()
+    expect(reloaded.get().settings.expanded).toBe(true)
+  })
+
+  it('waits for an in-flight write before treating a matching fingerprint as durable', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'codex-state-concurrent-save-v2-'))
+    roots.push(root)
+    const file = join(root, 'usage-state.json')
+    const store = new StateStore(file)
+    await store.load()
+    await store.save()
+    const target = store as unknown as { writeGenerationAtomically: (content: string) => Promise<void> }
+    const original = target.writeGenerationAtomically.bind(store)
+    let releaseWrite!: () => void
+    let started!: () => void
+    const gate = new Promise<void>((resolve) => { releaseWrite = resolve })
+    const writeStarted = new Promise<void>((resolve) => { started = resolve })
+    target.writeGenerationAtomically = async (content) => {
+      started()
+      await gate
+      await original(content)
+    }
+
+    store.update((state) => { state.settings.expanded = true })
+    const firstSave = store.save()
+    await writeStarted
+    store.update((state) => { state.settings.expanded = false })
+    let secondSaveSettled = false
+    const secondSave = store.save().then(() => { secondSaveSettled = true })
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    expect(secondSaveSettled).toBe(false)
+
+    releaseWrite()
+    await Promise.all([firstSave, secondSave])
+    target.writeGenerationAtomically = original
+    const reloaded = new StateStore(file)
+    await reloaded.load()
+    expect(reloaded.get().settings.expanded).toBe(false)
   })
 
   it('normalizes persisted processing work back to pending after a restart', () => {
