@@ -172,7 +172,21 @@ const STALE_AFTER_MS = 36 * 60 * 60 * 1_000
 const REQUEST_TIMEOUT_MS = 10_000
 const MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 const LONG_CONTEXT_THRESHOLD = 272_000n
-export const PRICING_NORMALIZATION_REVISION = 3
+export const PRICING_NORMALIZATION_REVISION = 4
+
+// First verified from the official page in this release. This is an observation
+// boundary, not a claimed launch date; do not backdate historical pricing.
+const ASTRA_PROVENANCE: PriceComponentProvenance = {
+  componentId: 'official-base-gpt-6-astra',
+  source: 'official',
+  sourceUrl: 'https://developers.openai.com/api/docs/models/gpt-6-astra',
+  sourceSha256: null,
+  sourceCommit: null,
+  effectiveAt: '2026-09-07T01:42:25.000Z',
+  observedAt: '2026-09-07T01:42:25.000Z',
+  checkedAt: '2026-09-07T01:42:25.000Z',
+  quality: 'verified'
+}
 
 const LITELLM_SOURCE_URL = `https://github.com/${LITELLM_OWNER}/${LITELLM_REPOSITORY}/blob/${LITELLM_BRANCH}/${LITELLM_PATH}`
 const MODELS_DEV_SOURCE_URL = MODELS_DEV_URL
@@ -637,7 +651,7 @@ function hasCanonicalBaseProvenance(model: string, price: StoredModelPrice): boo
 }
 
 function isCanonicalPricingSource(value: unknown): value is PricingSource {
-  return value === 'litellm' || value === 'models.dev' || value === 'live-models.dev' || value === 'embedded'
+  return value === 'litellm' || value === 'models.dev' || value === 'live-models.dev' || value === 'embedded' || value === 'official'
 }
 
 export function resolveModelPrice(book: StoredPriceBook, model: string, options: { exactOnly?: boolean } = {}): StoredModelPrice | undefined {
@@ -672,11 +686,18 @@ export function resolveEffectiveModelPricing(
   const revision = validLedger
     .filter((candidate) => candidate.effectiveMs <= eventMs)
     .sort(compareLedgerCandidates)[0]?.entry
-  if (ledger.length > 0 && !revision) return { modelId, price: undefined, longContextThreshold: null, hasEffectiveBase: false, hasEffectiveLong: false, fastFact: null }
+  const eligibleAstraFallback = modelId === 'gpt-6-astra' && eventMs >= parseTimestamp(ASTRA_PROVENANCE.effectiveAt)
+  if (ledger.length > 0 && !revision && !eligibleAstraFallback) return { modelId, price: undefined, longContextThreshold: null, hasEffectiveBase: false, hasEffectiveLong: false, fastFact: null }
   const modelBook = revision
     ? { ...book, models: revision.models as Record<string, StoredModelPrice> }
-    : book
-  const resolved = resolveCanonicalModelPrice(modelBook, model)
+    : ledger.length > 0 ? { ...book, models: {} } : book
+  let resolved = resolveCanonicalModelPrice(modelBook, model)
+  // An old whole-book ledger may predate support for Astra. Its absence is
+  // not a price revision: fill only that missing model from the independently
+  // dated official fact, without moving any other model's history backwards.
+  if (!resolved && eligibleAstraFallback) {
+    resolved = { key: modelId, price: createAstraPrice() }
+  }
   const price = resolved?.price
   const baseEffectiveMs = price?.base?.effectiveAt ? Date.parse(price.base.effectiveAt) : Number.NaN
   if (!price || !price.base?.effectiveAt || !Number.isFinite(baseEffectiveMs) || baseEffectiveMs > eventMs || !hasEffectiveBase(price)) {
@@ -909,6 +930,7 @@ function createEmbeddedModels(now: string): Record<string, StoredModelPrice> {
     longComponent: { ...EMBEDDED_LONG_PROVENANCE, componentId: `embedded-long-${model}`, observedAt: now }
   })
   return {
+    'gpt-6-astra': createAstraPrice(),
     'gpt-5.6-sol': make('gpt-5.6-sol', priceSet('5', '0.5', '6.25', '30'), priceSet('10', '1', '12.5', '45')),
     'gpt-5.6': make('gpt-5.6', priceSet('5', '0.5', '6.25', '30'), priceSet('10', '1', '12.5', '45')),
     'gpt-5.6-terra': make('gpt-5.6-terra', priceSet('2', '0.2', '2.5', '12'), priceSet('4', '0.4', '5', '18')),
@@ -916,6 +938,16 @@ function createEmbeddedModels(now: string): Record<string, StoredModelPrice> {
     'gpt-5.5': make('gpt-5.5', priceSet('5', '0.5', '6.25', '30'), priceSet('10', '1', '12.5', '45')),
     'gpt-5.4': make('gpt-5.4', priceSet('5', '0.5', '6.25', '30'), priceSet('10', '1', '12.5', '45')),
     'gpt-5.3-codex': make('gpt-5.3-codex', priceSet('5', '0.5', '6.25', '30'), priceSet('10', '1', '12.5', '45'))
+  }
+}
+
+function createAstraPrice(): StoredModelPrice {
+  return {
+    short: priceSet('10', '1', '12.5', '50'),
+    long: priceSet('20', '2', '25', '75'),
+    longContextThreshold: LONG_CONTEXT_THRESHOLD.toString(),
+    base: { ...ASTRA_PROVENANCE },
+    longComponent: { ...ASTRA_PROVENANCE, componentId: 'official-long-gpt-6-astra' }
   }
 }
 
@@ -929,7 +961,12 @@ function createEmbeddedLongSupplement(now: string): Record<string, StoredModelPr
 }
 
 function createFastFacts(now: string): Record<string, FastPriceFact> {
-  const result: Record<string, FastPriceFact> = {}
+  const result: Record<string, FastPriceFact> = {
+    'gpt-6-astra': {
+      model: 'gpt-6-astra', numerator: '2', denominator: '1',
+      source: { ...ASTRA_PROVENANCE, componentId: 'official-fast-gpt-6-astra' }
+    }
+  }
   for (const [model, value] of Object.entries(FAST_PRICE_FACTS)) {
     const reduced = reduceRational(value.numerator, value.denominator)
     result[model] = {
@@ -1269,6 +1306,17 @@ function parseLatestCommitMetadata(value: unknown): { sha: string; date: string 
 function ensurePriceBook(book: StoredPriceBook): StoredPriceBook {
   const embedded = createBundledPriceBook(book.updatedAt || new Date().toISOString())
   const candidate = { ...embedded, ...book, models: book.models ?? embedded.models, conflicts: book.conflicts ?? [], fastFacts: book.fastFacts ?? embedded.fastFacts, lastError: book.lastError ?? null }
+  if (book.normalizationRevision === 3 && isValidPriceBook({ ...candidate, normalizationRevision: PRICING_NORMALIZATION_REVISION })) {
+    const models = { ...candidate.models }
+    models['gpt-6-astra'] ??= embedded.models['gpt-6-astra']!
+    return {
+      ...candidate, models, normalizationRevision: PRICING_NORMALIZATION_REVISION,
+      fastFacts: { ...embedded.fastFacts, ...candidate.fastFacts },
+      payloadSha256: canonicalPricingHash(models),
+      // Refetch the raw payload: the old normalized cache excluded GPT-6.
+      sourceEtag: null, commitEtag: null, liveModelsDevEtag: null, stale: true
+    }
+  }
   if (!isValidPriceBook(candidate)) {
     return {
       ...embedded,
@@ -1346,7 +1394,7 @@ function hasPositiveRate(value: StoredPriceSet): boolean {
 
 function isRecognizedModel(model: string): boolean {
   const normalized = normalizeModelId(model)
-  return /^(?:gpt-5(?:[.-]|$)|o[134](?:[.-]|$)|codex(?:[.-]|$))/iu.test(normalized) && !/^(?:azure|anthropic|bedrock|vertex)[/:]/iu.test(model)
+  return /^(?:gpt-[56](?:[.-]|$)|o[134](?:[.-]|$)|codex(?:[.-]|$))/iu.test(normalized) && !/^(?:azure|anthropic|bedrock|vertex)[/:]/iu.test(model)
 }
 
 function parseJson(value: string): unknown {

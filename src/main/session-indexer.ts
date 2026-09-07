@@ -302,11 +302,16 @@ export class SessionIndexer {
         if (fullReplay) applyReplayProvenance(state, this.replayBaseline, this.replayFailures, this.replayedSessionIds, this.retainedSessionIds, this.replayReplacementBaselines)
         else if (this.replayedSessionIds.size > 0 || this.retainedSessionIds.size > 0) applyReplayProvenance(state, null, this.replayFailures, this.replayedSessionIds, this.retainedSessionIds, this.replayReplacementBaselines)
         else if (this.replayFailures.size > 0) state.rebuild.failureDiagnostics = [...this.replayFailures].sort()
+        if (complete) {
+          state.rebuild.failureDiagnostics = []
+          state.rebuild.retainedLegacySessions = 0
+        }
       })
       if (fullReplay) await this.commitWorkingProjection()
       this.replayBaseline = null
       this.fullReplayActive = false
-      await this.store.save()
+      if (trigger === 'periodic' && !fullReplay) this.store.scheduleSave()
+      else await this.store.save()
       this.setProgress({
         state: 'idle',
         indexedFiles: actionableFiles.length,
@@ -639,7 +644,11 @@ export class SessionIndexer {
       this.completeQueueEntry(queueId)
       return
     }
-    if (replayFromRaw && !session.lastCumulative) {
+    // A complete, valid session may contain only metadata or quota events.
+    // It can converge as empty only if no previously observed usage is lost.
+    const emptySession = session.parseErrors === 0 && completeEnd === candidate.size &&
+      !hasStoredUsage(stored)
+    if (replayFromRaw && !session.lastCumulative && !emptySession) {
       const fallback = preserveLegacyFallback(candidate, stored ?? session)
       this.recordReplayFailure('raw-invalid')
       this.retainLegacyProjection(candidate, fallback)
@@ -845,6 +854,14 @@ function applyReplayProvenance(
 function legacyProjectionTotal(session: StoredSessionState | undefined): bigint {
   if (!session) return 0n
   return sumDailyTokens(session.legacyDaily) + sumDailyTokens(session.daily)
+}
+
+function hasStoredUsage(session: StoredSessionState | undefined): boolean {
+  if (!session) return false
+  if (session.lastCumulative || session.eventCount > 0 || (session.legacyEventCount ?? 0) > 0) return true
+  // Preserve even partial historical slices, including cycle-only records.
+  return [session.daily, session.legacyDaily, session.cycles, session.legacyCycles]
+    .some((records) => Object.keys(records ?? {}).length > 0)
 }
 
 function sumDailyTokens(daily: Record<string, StoredDailyAggregate> | undefined): bigint {

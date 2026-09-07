@@ -16,11 +16,88 @@ import {
   reduceRational,
   roundAttoUsdToMicroUsd,
   resolveEffectiveModelPricing,
+  resolveCanonicalModelPrice,
   type FastPriceFact
 } from '../../src/main/pricing.js'
 import { zeroTokens } from '../../src/main/token-math.js'
 
 describe('structured pricing v2 contracts', () => {
+  it('recognizes GPT-6 from supported providers without aliasing internal review models', () => {
+    const rate = { input_cost_per_token: '0.00001', cache_read_input_token_cost: '0.000001', output_cost_per_token: '0.00005' }
+    const models = normalizeLiteLLMPriceBook({
+      'openai/gpt-6-astra': { ...rate, litellm_provider: 'openai' },
+      'gpt-6-other': { ...rate, litellm_provider: 'anthropic' },
+      'azure/gpt-6-astra': rate
+    })
+    expect(Object.keys(models)).toEqual(['gpt-6-astra'])
+    expect(resolveCanonicalModelPrice({ ...createBundledPriceBook(), models }, 'GPT-6-ASTRA')?.key).toBe('gpt-6-astra')
+    expect(resolveCanonicalModelPrice(createBundledPriceBook(), 'codex-auto-review')).toBeUndefined()
+  })
+
+  it('prices Astra Standard, long context and Fast only after the verified observation', () => {
+    const book = createBundledPriceBook('2026-09-07T02:00:00.000Z')
+    const before = resolveEffectiveModelPricing(book, 'gpt-6-astra', '2026-09-06T00:00:00.000Z')
+    expect(before.hasEffectiveBase).toBe(false)
+    const effective = resolveEffectiveModelPricing(book, 'gpt-6-astra', '2026-09-07T02:00:00.000Z')
+    expect(effective.hasEffectiveBase).toBe(true)
+    expect(effective.longContextThreshold).toBe(272_000n)
+    expect(effective.price?.base?.source).toBe('official')
+    const usage = { ...zeroTokens(), input: 1_000_000n, total: 1_000_000n }
+    expect(calculateModelCost({ short: usage, long: zeroTokens() }, effective.price).microUsd).toBe(10_000_000n)
+    expect(calculateModelCost({ short: zeroTokens(), long: usage }, effective.price).microUsd).toBe(20_000_000n)
+    expect(calculateModelCost({ short: zeroTokens(), long: usage }, effective.price, { fast: true, fastFact: effective.fastFact }).microUsd).toBe(40_000_000n)
+    expect(fastFactForModel('gpt-6-astra', book, '2026-09-06T00:00:00.000Z')).toBeNull()
+  })
+
+  it('upgrades the old fresh cache immediately and preserves existing rates when offline', async () => {
+    const { PricingService } = await import('../../src/main/pricing.js')
+    let book = createBundledPriceBook()
+    delete book.models['gpt-6-astra']
+    delete book.fastFacts!['gpt-6-astra']
+    book.normalizationRevision = 3
+    book.models['gpt-5.4']!.short.inputMicroUsdPerMillion = '777'
+    book.payloadSha256 = canonicalPricingHash(book.models)
+    book.stale = false
+    book.sourceQuality = 'verified'
+    book.checkedAt = new Date().toISOString()
+    let calls = 0
+    const service = new PricingService(() => book, next => { book = next }, () => undefined, async () => {
+      calls += 1
+      throw new Error('offline')
+    })
+    await service.refreshIfDue()
+    expect(calls).toBe(1)
+    expect(book.models['gpt-6-astra']?.long).toBeDefined()
+    expect(book.models['gpt-5.4']?.short.inputMicroUsdPerMillion).toBe('777')
+    expect(book.normalizationRevision).toBe(4)
+    expect(book.sourceEtag).toBeNull()
+  })
+
+  it('fills only missing Astra history at the official boundary despite later whole-book ledgers', () => {
+    const book = createBundledPriceBook('2026-09-07T04:00:00.000Z')
+    const oldModels = { ...book.models }
+    delete oldModels['gpt-6-astra']
+    const ledger = [
+      { effectiveAt: '2026-09-07T00:00:00.000Z', observedAt: '2026-09-07T00:00:00.000Z', models: oldModels },
+      { effectiveAt: '2026-09-07T03:00:00.000Z', observedAt: '2026-09-07T04:00:00.000Z', models: book.models }
+    ]
+    for (const history of [ledger, ledger.slice(1)]) {
+      const priced = resolveEffectiveModelPricing(book, 'gpt-6-astra', '2026-09-07T02:00:00.000Z', history)
+      expect(priced.price?.base?.source).toBe('official')
+      expect(priced.hasEffectiveBase).toBe(true)
+      expect(priced.fastFact?.numerator).toBe('2')
+      expect(resolveEffectiveModelPricing(book, 'gpt-6-astra', '2026-09-07T01:00:00.000Z', history).hasEffectiveBase).toBe(false)
+    }
+    expect(resolveEffectiveModelPricing(book, 'gpt-5.6-sol', '2026-09-07T02:00:00.000Z', ledger.slice(1)).hasEffectiveBase).toBe(false)
+    expect(oldModels['gpt-6-astra']).toBeUndefined()
+    // A dated model rate that actually exists must retain priority over fallback.
+    const explicit = createBundledPriceBook()
+    explicit.models['gpt-6-astra']!.short.inputMicroUsdPerMillion = '123'
+    expect(resolveEffectiveModelPricing(book, 'gpt-6-astra', '2026-09-07T02:00:00.000Z', [
+      { effectiveAt: '2026-09-07T01:50:00.000Z', models: explicit.models }
+    ]).price?.short.inputMicroUsdPerMillion).toBe('123')
+  })
+
   it('converts LiteLLM USD/token to integer microUSD/M and leaves missing writes absent', () => {
     const models = normalizeLiteLLMPriceBook({
       'gpt-5.4': {

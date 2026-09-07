@@ -16,6 +16,66 @@ afterEach(async () => {
 })
 
 describe('session reconciliation v2', () => {
+  it('reconciles an old metadata-only fallback and counts a later first usage exactly once', async () => {
+    const { file, root, sessionId } = await makeSession(JSON.stringify({ type: 'event_msg', payload: { type: 'token_count', info: null } }))
+    const store = new StateStore(join(root, 'state.json'))
+    await store.load()
+    const indexer = new SessionIndexer(root, store, 0, () => undefined)
+    await indexer.scan()
+    store.update(state => {
+      const session = state.sessions[sessionId]!
+      session.fullRawReplayPending = true
+      session.unreconciled = true
+      session.legacyUnpriced = true
+      session.offset = 0
+      state.unreconciledSessions = [sessionId]
+      state.rebuild.failureDiagnostics = ['raw-invalid']
+    })
+    await indexer.scan('initial')
+    expect(store.get().rebuild.state).toBe('complete')
+    expect(store.get().rebuild.failureDiagnostics).toEqual([])
+    expect(store.get().unreconciledSessions).toEqual([])
+    expect(store.get().sessions[sessionId]?.offset).toBe((await stat(file)).size)
+    const reloaded = new StateStore(join(root, 'state.json'))
+    await reloaded.load()
+    const resumed = new SessionIndexer(root, reloaded, 0, () => undefined)
+    await resumed.scan('initial') // One metadata bootstrap is allowed after reload.
+    await resumed.scan('periodic')
+    expect(reloaded.get().rebuild.processedFiles).toBe(0)
+    await appendFile(file, `${tokenLine(100, 60, 10, 110)}\n`)
+    await resumed.scan()
+    await resumed.scan()
+    expect(reloaded.get().sessions[sessionId]?.lastCumulative?.total).toBe('110')
+    expect(reloaded.get().sessions[sessionId]?.eventCount).toBe(1)
+  })
+
+  it('retains historical usage when a full replay now contains only metadata', async () => {
+    const { file, root, sessionId } = await makeSession(tokenLine(100, 60, 10, 110))
+    const store = new StateStore(join(root, 'state.json'))
+    await store.load()
+    const indexer = new SessionIndexer(root, store, 0, () => undefined)
+    await indexer.scan()
+    const original = store.get().sessions[sessionId]!.daily
+    await writeFile(file, `${JSON.stringify({ type: 'turn_context', payload: { model: 'gpt-5.6-sol' } })}\n`)
+    store.update(state => { state.sessions[sessionId]!.fullRawReplayPending = true })
+    await indexer.scan()
+    expect(store.get().sessions[sessionId]?.daily).toEqual(original)
+    expect(store.get().rebuild.state).toBe('partial')
+    expect(store.get().rebuild.failureDiagnostics).toContain('raw-invalid')
+  })
+
+  it('does not accept malformed JSON as a valid empty replay', async () => {
+    const { root, sessionId } = await makeSession('{invalid}')
+    const store = new StateStore(join(root, 'state.json'))
+    await store.load()
+    const indexer = new SessionIndexer(root, store, 0, () => undefined)
+    await indexer.scan()
+    store.update(state => { state.sessions[sessionId]!.fullRawReplayPending = true })
+    await indexer.scan()
+    expect(store.get().rebuild.state).toBe('partial')
+    expect(store.get().rebuild.failureDiagnostics).toContain('raw-invalid')
+  })
+
   it('replays an actual v1 baseline once, preserves the legacy file, and records the exact raw offset', async () => {
     const { file, root, sessionId } = await makeSession(tokenLine(76_240_615, 0, 0, 76_240_615), 'gpt-5.6-sol')
     const statePath = join(root, 'usage-state.json')

@@ -1,17 +1,60 @@
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { SessionIndexer } from '../../src/main/session-indexer.js'
 import { ATTRIBUTION_REVISION, createDefaultState, createEmptyStoredModelAggregate, migrateLegacyState, STATE_INDEX_REVISION, StateStore } from '../../src/main/state.js'
 
 const roots: string[] = []
 
 afterEach(async () => {
+  vi.useRealTimers()
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })))
 })
 
 describe('state v2 generation persistence', () => {
+  it('batches continuous background changes without postponing the first deadline', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'codex-state-batch-'))
+    roots.push(root)
+    const store = new StateStore(join(root, 'state.json'), { backgroundSaveDelayMs: 60_000 })
+    await store.load()
+    await store.save()
+    const target = store as unknown as { writeGenerationAtomically: (content: string) => Promise<void> }
+    const write = vi.spyOn(target, 'writeGenerationAtomically')
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    for (let index = 1; index <= 4; index += 1) {
+      store.update(state => { state.account.lifetimeTokens = String(index) })
+      await vi.advanceTimersByTimeAsync(15_000)
+      if (index < 4) expect(write).not.toHaveBeenCalled()
+    }
+    expect(write).toHaveBeenCalledTimes(1)
+    await store.save() // Wait for the timer's real filesystem write.
+    expect(write).toHaveBeenCalledTimes(1)
+    const reloaded = new StateStore(join(root, 'state.json'))
+    await reloaded.load()
+    expect(reloaded.get().account.lifetimeTokens).toBe('4')
+  })
+
+  it('keeps periodic changes live until an explicit flush persists them', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'codex-state-periodic-flush-'))
+    roots.push(root)
+    const file = join(root, 'state.json')
+    const store = new StateStore(file, { backgroundSaveDelayMs: 60_000 })
+    await store.load()
+    const indexer = new SessionIndexer(root, store, 0, () => undefined)
+    await indexer.scan('initial')
+    const manifest = await store.readManifest()
+    store.update(state => { state.account.lifetimeTokens = '42' })
+    await indexer.scan('periodic')
+    expect(store.get().account.lifetimeTokens).toBe('42')
+    expect((await store.readManifest())?.active.file).toBe(manifest?.active.file)
+    await store.save()
+    expect((await store.readManifest())?.active.file).not.toBe(manifest?.active.file)
+    const reloaded = new StateStore(file)
+    await reloaded.load()
+    expect(reloaded.get().account.lifetimeTokens).toBe('42')
+  })
+
   it('migrates v1 settings/account and marks old sessions legacy-unpriced', () => {
     const migrated = migrateLegacyState({
       version: 1,

@@ -44,7 +44,7 @@ export class UsageService extends EventEmitter {
     private readonly diagnosticsFlushTimeoutMs = DIAGNOSTICS_FLUSH_TIMEOUT_MS
   ) {
     super()
-    this.store = new StateStore(join(userDataPath, 'usage-state.json'))
+    this.store = new StateStore(join(userDataPath, 'usage-state.json'), { backgroundSaveDelayMs: 60_000 })
     this.diagnostics = diagnostics
     this.pricing = new PricingService(
       () => this.store.get().priceBook,
@@ -127,6 +127,7 @@ export class UsageService extends EventEmitter {
       this.indexer?.scan('manual') ?? Promise.resolve(),
       this.pricing.refreshIfDue(true)
     ])
+    await this.store.save()
     this.emitSnapshot()
     return this.getSnapshot()
   }
@@ -134,7 +135,7 @@ export class UsageService extends EventEmitter {
   updateSettings(patch: Partial<OverlaySettings>): DashboardSnapshot {
     this.store.update((state) => {
       state.settings = { ...state.settings, ...patch }
-    })
+    }, true)
     this.emitSnapshot()
     return this.getSnapshot()
   }

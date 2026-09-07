@@ -204,6 +204,8 @@ export function createEmptyStoredSpeedAggregate(): StoredSpeedAggregate {
 }
 
 export interface StateStoreOptions {
+  /** Maximum batching window for background updates; explicit saves still flush. */
+  backgroundSaveDelayMs?: number
   /** Optional deterministic generation directory for tests. */
   generationDirectory?: string
   /** Disable the direct legacy fallback only in tests that explicitly want it. */
@@ -227,11 +229,13 @@ export class StateStore {
   private readonly generationDirectory: string
   private readonly manifestPath: string
   private readonly legacyFallback: boolean
+  private readonly backgroundSaveDelayMs: number
 
   constructor(private readonly filePath: string, options: StateStoreOptions = {}) {
     this.generationDirectory = options.generationDirectory ?? `${filePath}.generations`
     this.manifestPath = `${filePath}.manifest.json`
     this.legacyFallback = options.legacyFallback ?? true
+    this.backgroundSaveDelayMs = options.backgroundSaveDelayMs ?? 750
   }
 
   async load(): Promise<PersistentState> {
@@ -288,8 +292,9 @@ export class StateStore {
     await this.save()
   }
 
-  scheduleSave(delayMs = 750): void {
-    if (this.saveTimer) clearTimeout(this.saveTimer)
+  scheduleSave(delayMs = this.backgroundSaveDelayMs): void {
+    // Keep the first deadline: continuous activity must never postpone a save.
+    if (this.saveTimer) return
     this.saveTimer = setTimeout(() => {
       this.saveTimer = null
       void this.save()

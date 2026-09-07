@@ -126,7 +126,7 @@ export class OverlayWindow {
     const { x, y } = this.window.getBounds()
     this.store.update((state) => {
       state.window = { x, y }
-    })
+    }, true)
   }
 }
 

@@ -217,7 +217,9 @@ export function App(): ReactElement {
             <div className="model-row" key={model.model}>
               <span title={model.model}>{prettyModelName(model.model)}</span>
               <strong>{formatTokens(model.tokens.total)}</strong>
-              <small>{formatMicroUsd(model.apiEquivalentMicroUsd)}</small>
+              <small title={model.apiEquivalentMicroUsd === null ? 'No supported price for this usage; retained in token totals.' : undefined}>
+                {model.apiEquivalentMicroUsd === null ? 'Unpriced' : formatMicroUsd(model.apiEquivalentMicroUsd)}
+              </small>
             </div>
           ))
         )}
