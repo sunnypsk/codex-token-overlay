@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
-import type { OverlaySettings, RateLimitBucket } from '../shared/contracts.js'
+import type { OverlaySettings, QuotaObservation, RateLimitBucket } from '../shared/contracts.js'
 import { parseRateLimitBuckets } from './app-server-client.js'
 import { StateStore } from './state.js'
 
@@ -11,7 +11,17 @@ export interface QuotaState {
   window: { x: number | null; y: number | null }
   rateLimits: RateLimitBucket[]
   rateLimitsSyncedAt: string | null
+  quotaHistory: QuotaCycleHistory | null
 }
+
+export interface QuotaCycleHistory {
+  limitId: string
+  resetsAt: number
+  windowDurationMins: number
+  observations: QuotaObservation[]
+}
+
+export const MAX_QUOTA_OBSERVATIONS = 10_080
 
 export function createDefaultQuotaState(): QuotaState {
   return {
@@ -19,7 +29,8 @@ export function createDefaultQuotaState(): QuotaState {
     settings: { alwaysOnTop: true, startAtLogin: true, expanded: false },
     window: { x: null, y: null },
     rateLimits: [],
-    rateLimitsSyncedAt: null
+    rateLimitsSyncedAt: null,
+    quotaHistory: null
   }
 }
 
@@ -55,7 +66,8 @@ export class QuotaStateStore {
       settings: { ...legacy.settings },
       window: { ...legacy.window },
       rateLimits: normalizeRateLimits(legacy.rateLimits),
-      rateLimitsSyncedAt: validTimestamp(legacy.rateLimitsSyncedAt)
+      rateLimitsSyncedAt: validTimestamp(legacy.rateLimitsSyncedAt),
+      quotaHistory: null
     }
     await this.save()
     return this.state
@@ -129,8 +141,29 @@ function normalizeQuotaState(value: unknown): QuotaState | null {
     },
     window: { x: window.x as number | null, y: window.y as number | null },
     rateLimits: normalizeRateLimits(value.rateLimits),
-    rateLimitsSyncedAt: validTimestamp(value.rateLimitsSyncedAt)
+    rateLimitsSyncedAt: validTimestamp(value.rateLimitsSyncedAt),
+    quotaHistory: normalizeQuotaHistory(value.quotaHistory)
   }
+}
+
+function normalizeQuotaHistory(value: unknown): QuotaCycleHistory | null {
+  if (!isRecord(value) || typeof value.limitId !== 'string' || !value.limitId ||
+    typeof value.resetsAt !== 'number' || !Number.isFinite(value.resetsAt) ||
+    typeof value.windowDurationMins !== 'number' || !Number.isFinite(value.windowDurationMins) ||
+    value.windowDurationMins <= 0 || !Array.isArray(value.observations)) return null
+
+  const startsAt = value.resetsAt * 1_000 - value.windowDurationMins * 60_000
+  const observations: QuotaObservation[] = []
+  for (const point of value.observations.slice(-MAX_QUOTA_OBSERVATIONS)) {
+    if (!isRecord(point) || typeof point.at !== 'string' || typeof point.usedPercent !== 'number' ||
+      !Number.isFinite(point.usedPercent) || point.usedPercent < 0) continue
+    const atMs = Date.parse(point.at)
+    if (!Number.isFinite(atMs) || atMs < startsAt || atMs >= value.resetsAt * 1_000 ||
+      (observations.length > 0 && atMs <= Date.parse(observations[observations.length - 1]!.at))) continue
+    observations.push({ at: new Date(atMs).toISOString(), usedPercent: point.usedPercent })
+  }
+  return { limitId: value.limitId, resetsAt: value.resetsAt,
+    windowDurationMins: value.windowDurationMins, observations }
 }
 
 function normalizeRateLimits(value: unknown): RateLimitBucket[] {

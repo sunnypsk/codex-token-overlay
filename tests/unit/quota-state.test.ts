@@ -1,8 +1,8 @@
-import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { QuotaStateStore } from '../../src/main/quota-state.js'
+import { createDefaultQuotaState, QuotaStateStore } from '../../src/main/quota-state.js'
 import { StateStore } from '../../src/main/state.js'
 
 const roots: string[] = []
@@ -41,7 +41,7 @@ describe('quota state migration', () => {
     expect(imported.rateLimitsSyncedAt).toBe('2026-09-23T12:00:00.000Z')
 
     const saved = JSON.parse(await readFile(quotaPath, 'utf8')) as Record<string, unknown>
-    expect(Object.keys(saved).sort()).toEqual(['rateLimits', 'rateLimitsSyncedAt', 'settings', 'version', 'window'])
+    expect(Object.keys(saved).sort()).toEqual(['quotaHistory', 'rateLimits', 'rateLimitsSyncedAt', 'settings', 'version', 'window'])
     expect(JSON.stringify(saved)).not.toContain('123456')
     expect(await readFile(manifestPath)).toEqual(beforeManifest)
     expect(await readdir(`${legacyPath}.generations`)).toEqual(beforeGenerations)
@@ -51,5 +51,27 @@ describe('quota state migration', () => {
     const reloaded = new QuotaStateStore(quotaPath, legacyPath)
     expect((await reloaded.load()).settings.expanded).toBe(false)
     expect(await readFile(manifestPath)).toEqual(beforeManifest)
+  })
+
+  it('loads an older quota file without history and preserves newly recorded points', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'codex-quota-history-'))
+    roots.push(root)
+    const quotaPath = join(root, 'quota-state.json')
+    const legacyPath = join(root, 'usage-state.json')
+    const oldState = createDefaultQuotaState()
+    oldState.settings.expanded = true
+    delete (oldState as Partial<typeof oldState>).quotaHistory
+    await writeFile(quotaPath, JSON.stringify(oldState), 'utf8')
+
+    const store = new QuotaStateStore(quotaPath, legacyPath)
+    expect((await store.load()).quotaHistory).toBeNull()
+    expect(store.get().settings.expanded).toBe(true)
+    store.update((state) => {
+      state.quotaHistory = { limitId: 'codex', resetsAt: 2_000_000_000,
+        windowDurationMins: 10_080, observations: [{ at: '2033-05-18T00:00:00.000Z', usedPercent: 27 }] }
+    })
+    await store.save()
+    const loaded = await new QuotaStateStore(quotaPath, legacyPath).load()
+    expect(loaded.quotaHistory?.observations).toEqual([{ at: '2033-05-18T00:00:00.000Z', usedPercent: 27 }])
   })
 })

@@ -130,6 +130,11 @@ export interface QuotaProjection {
   projectedUsedPercent: number | null
 }
 
+export interface QuotaObservation {
+  at: string
+  usedPercent: number
+}
+
 export interface CurrentWeekEstimate {
   /** Priced API-equivalent cost observed in the current reset cycle. */
   observedMicroUsd: string | null
@@ -212,8 +217,10 @@ export interface QuotaSnapshot {
   reset: {
     limitId: string | null
     usedPercent: number | null
+    startsAt: string | null
     resetsAt: string | null
     projection: QuotaProjection
+    observations: QuotaObservation[]
   }
   additionalLimits: Array<{
     limitId: string

@@ -4,6 +4,7 @@ import type { OverlaySettings, QuotaSnapshot, RateLimitBucket } from '../shared/
 import { AppServerClient } from './app-server-client.js'
 import { findCodexExecutable } from './codex-executable.js'
 import { buildQuotaSnapshot, type QuotaRuntimeStatus } from './quota-snapshot.js'
+import { recordQuotaObservation } from './quota-history.js'
 import { QuotaStateStore } from './quota-state.js'
 
 const RATE_LIMIT_POLL_MS = 60_000
@@ -148,9 +149,11 @@ export class QuotaService extends EventEmitter {
     try {
       const buckets = await client.readRateLimits()
       if (this.stopped || this.appServer !== client) return
+      const syncedAtMs = Date.now()
       this.store.update((state) => {
         state.rateLimits = buckets
-        state.rateLimitsSyncedAt = new Date().toISOString()
+        state.rateLimitsSyncedAt = new Date(syncedAtMs).toISOString()
+        recordQuotaObservation(state, syncedAtMs)
       })
       this.runtime = { appServer: 'online', message: null }
       this.emitSnapshot()

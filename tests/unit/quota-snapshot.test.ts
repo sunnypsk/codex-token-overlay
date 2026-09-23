@@ -29,7 +29,19 @@ describe('quota snapshot', () => {
     expect(snapshot.reset.projection).toEqual({ status: 'lasts-until-reset', projectedUsedPercent: 50 })
     expect(snapshot.additionalLimits).toEqual([{ limitId: 'extra', label: 'Other limit', usedPercent: 10, resetsAt: resetSeconds }])
     expect(snapshot.stale).toBe(false)
+    expect(snapshot.reset.startsAt).toBe(new Date(resetSeconds * 1_000 - weekMinutes * 60_000).toISOString())
+    expect(snapshot.reset.observations).toEqual([])
     expect(Object.keys(snapshot)).not.toContain('periods')
+  })
+
+  it.each([[25, 50], [50, 100], [75, 150]])('matches the last observation and projects %i%% to %i%%', (used, expected) => {
+    const state = stateWithLimits(used)
+    const observedAt = now - 20_000
+    state.quotaHistory = { limitId: 'codex', resetsAt: resetSeconds, windowDurationMins: weekMinutes,
+      observations: [{ at: new Date(observedAt).toISOString(), usedPercent: used }] }
+    const snapshot = buildQuotaSnapshot(state, { appServer: 'online', message: null }, now)
+    expect(snapshot.reset.observations).toEqual(state.quotaHistory.observations)
+    expect(snapshot.reset.projection.projectedUsedPercent).toBe(expected)
   })
 
   it('keeps the last active percentage but suppresses forecasts while offline or old', () => {
@@ -37,6 +49,12 @@ describe('quota snapshot', () => {
     expect(offline.reset.usedPercent).toBe(25)
     expect(offline.reset.projection.status).toBe('unavailable')
     expect(offline.stale).toBe(true)
+
+    const withHistory = stateWithLimits()
+    withHistory.quotaHistory = { limitId: 'codex', resetsAt: resetSeconds, windowDurationMins: weekMinutes,
+      observations: [{ at: new Date(now - 20_000).toISOString(), usedPercent: 25 }] }
+    expect(buildQuotaSnapshot(withHistory, { appServer: 'offline', message: 'Disconnected' }, now).reset.observations)
+      .toEqual(withHistory.quotaHistory.observations)
 
     const old = stateWithLimits()
     old.rateLimitsSyncedAt = new Date(now - 121_000).toISOString()
@@ -47,6 +65,7 @@ describe('quota snapshot', () => {
     const expired = buildQuotaSnapshot(stateWithLimits(), { appServer: 'online', message: null }, resetSeconds * 1_000)
     expect(expired.reset.usedPercent).toBeNull()
     expect(expired.reset.resetsAt).toBeNull()
+    expect(expired.reset.observations).toEqual([])
     expect(expired.reset.projection.status).toBe('unavailable')
     expect(expired.additionalLimits[0]?.usedPercent).toBeNull()
 

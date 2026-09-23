@@ -1,7 +1,7 @@
 import { app, ipcMain } from 'electron'
 import type { QuotaSnapshot } from '../shared/contracts.js'
 import { OverlayTray } from './tray.js'
-import { QuotaService } from './quota-service.js'
+import { QuotaService, type QuotaServiceOptions } from './quota-service.js'
 import { OverlayWindow } from './window-manager.js'
 
 const isE2e = process.env.CODEX_OVERLAY_E2E === '1'
@@ -21,7 +21,18 @@ if (!usesIsolatedE2eProfile && !app.requestSingleInstanceLock()) {
 
   app.whenReady().then(async () => {
     app.setAppUserModelId('com.local.codextokenoverlay')
-    service = new QuotaService(app.getPath('userData'))
+    const fixtureOptions: QuotaServiceOptions = usesIsolatedE2eProfile && process.env.CODEX_OVERLAY_E2E_FIXTURE === '1'
+      ? {
+          findExecutable: async () => 'fixture',
+          createClient: () => ({
+            on: () => undefined,
+            start: async () => ({ codexHome: app.getPath('userData') }),
+            stop: async () => undefined,
+            readRateLimits: async () => service?.store.get().rateLimits ?? []
+          })
+        }
+      : {}
+    service = new QuotaService(app.getPath('userData'), fixtureOptions)
     await service.start()
     applyLoginSetting(service.getSnapshot().settings.startAtLogin)
 

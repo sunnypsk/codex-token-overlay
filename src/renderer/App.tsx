@@ -3,6 +3,7 @@ import { ChevronDown, ChevronUp, Clock3, RefreshCw, Sparkles, X } from 'lucide-r
 import type { QuotaProjection, QuotaSnapshot } from '../shared/contracts'
 import { formatProjectedPercent } from '../shared/quota-projection'
 import { formatCountdown, formatFreshness, formatResetDate } from './format'
+import { QuotaTrendChart } from './QuotaTrendChart'
 
 export function App(): ReactElement {
   const [snapshot, setSnapshot] = useState<QuotaSnapshot | null>(null)
@@ -133,6 +134,9 @@ export function App(): ReactElement {
           <span>{projectionStatus(projection)}</span>
         </div>
       </section>
+
+      <QuotaTrendChart startsAt={resetExpired ? null : snapshot.reset.startsAt} resetsAt={resetAt}
+        observations={resetExpired ? [] : snapshot.reset.observations} projection={projection} />
 
       {snapshot.additionalLimits.length > 0 && (
         <section className="secondary-limits" aria-label="Other quota limits">

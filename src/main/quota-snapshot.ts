@@ -21,16 +21,24 @@ export function buildQuotaSnapshot(
   const window = activeWindow(primaryBucket?.primary ?? null, nowMs)
   const resetMs = window === null ? null : window.resetsAt * 1_000
   const startMs = window === null ? null : resetMs! - window.windowDurationMins * 60_000
+  const history = state.quotaHistory
+  const observations = window && history && history.limitId === primaryBucket?.limitId &&
+    history.resetsAt === window.resetsAt && history.windowDurationMins === window.windowDurationMins
+    ? history.observations.map((point) => ({ ...point })) : []
+  const latestAtMs = observations.length > 0
+    ? Date.parse(observations[observations.length - 1]!.at) : syncedAtMs
 
   return {
     generatedAt: new Date(nowMs).toISOString(),
     reset: {
       limitId: primaryBucket?.limitId ?? null,
       usedPercent: window?.usedPercent ?? null,
+      startsAt: startMs === null ? null : new Date(startMs).toISOString(),
       resetsAt: resetMs === null ? null : new Date(resetMs).toISOString(),
       projection: stale
         ? { status: 'unavailable', projectedUsedPercent: null }
-        : estimateQuotaProjection(window?.usedPercent ?? null, startMs, resetMs, nowMs)
+        : estimateQuotaProjection(window?.usedPercent ?? null, startMs, resetMs, latestAtMs),
+      observations
     },
     additionalLimits: state.rateLimits
       .filter((bucket) => bucket.limitId !== primaryBucket?.limitId)

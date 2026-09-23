@@ -3,7 +3,7 @@ import { join } from 'node:path'
 import type { QuotaStateStore } from './quota-state.js'
 
 const COLLAPSED_SIZE = { width: 340, height: 88 }
-const EXPANDED_SIZE = { width: 380, height: 300 }
+const EXPANDED_SIZE = { width: 380, height: 500 }
 const SCREEN_MARGIN = 20
 
 export class OverlayWindow {
