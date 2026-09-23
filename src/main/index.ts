@@ -1,7 +1,7 @@
 import { app, ipcMain } from 'electron'
-import type { DashboardSnapshot } from '../shared/contracts.js'
+import type { QuotaSnapshot } from '../shared/contracts.js'
 import { OverlayTray } from './tray.js'
-import { UsageService } from './usage-service.js'
+import { QuotaService } from './quota-service.js'
 import { OverlayWindow } from './window-manager.js'
 
 const isE2e = process.env.CODEX_OVERLAY_E2E === '1'
@@ -12,7 +12,7 @@ if (usesIsolatedE2eProfile && e2eUserDataPath) app.setPath('userData', e2eUserDa
 if (!usesIsolatedE2eProfile && !app.requestSingleInstanceLock()) {
   app.quit()
 } else {
-  let service: UsageService | null = null
+  let service: QuotaService | null = null
   let overlay: OverlayWindow | null = null
   let tray: OverlayTray | null = null
   let cleanupStarted = false
@@ -21,7 +21,7 @@ if (!usesIsolatedE2eProfile && !app.requestSingleInstanceLock()) {
 
   app.whenReady().then(async () => {
     app.setAppUserModelId('com.local.codextokenoverlay')
-    service = new UsageService(app.getPath('userData'), app.getPath('logs'))
+    service = new QuotaService(app.getPath('userData'))
     await service.start()
     applyLoginSetting(service.getSnapshot().settings.startAtLogin)
 
@@ -30,11 +30,11 @@ if (!usesIsolatedE2eProfile && !app.requestSingleInstanceLock()) {
     tray = createTray(service, overlay)
     registerIpc(service, overlay, () => tray, applyLoginSetting)
 
-    service.on('snapshot', (snapshot: DashboardSnapshot) => {
+    service.on('snapshot', (snapshot: QuotaSnapshot) => {
       if (!browserWindow.isDestroyed()) browserWindow.webContents.send('overlay:snapshot', snapshot)
       tray?.updateSettings(snapshot.settings)
       const used = snapshot.reset.usedPercent
-      tray?.setToolTip(used === null ? 'Codex Token Overlay' : `Codex usage: ${used.toFixed(0)}%`)
+      tray?.setToolTip(used === null ? 'Codex usage: N/A' : `Codex usage: ${used.toFixed(0)}%${snapshot.stale ? ' (last synced)' : ''}`)
     })
 
     app.on('activate', () => overlay?.show())
@@ -54,7 +54,7 @@ if (!usesIsolatedE2eProfile && !app.requestSingleInstanceLock()) {
   })
 }
 
-function createTray(service: UsageService, overlay: OverlayWindow): OverlayTray {
+function createTray(service: QuotaService, overlay: OverlayWindow): OverlayTray {
   return new OverlayTray(service.getSnapshot().settings, {
     toggleVisibility: () => overlay.toggleVisibility(),
     setAlwaysOnTop: (value) => {
@@ -71,7 +71,7 @@ function createTray(service: UsageService, overlay: OverlayWindow): OverlayTray 
 }
 
 function registerIpc(
-  service: UsageService,
+  service: QuotaService,
   overlay: OverlayWindow,
   getTray: () => OverlayTray | null,
   setLogin: (value: boolean) => void

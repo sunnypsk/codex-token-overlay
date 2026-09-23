@@ -206,13 +206,35 @@ export interface DashboardSnapshot {
   settings: OverlaySettings
 }
 
+/** The active IPC payload for the percentage-only overlay. */
+export interface QuotaSnapshot {
+  generatedAt: string
+  reset: {
+    limitId: string | null
+    usedPercent: number | null
+    resetsAt: string | null
+    projection: QuotaProjection
+  }
+  additionalLimits: Array<{
+    limitId: string
+    label: string
+    usedPercent: number | null
+    resetsAt: number | null
+  }>
+  connection: ConnectionState
+  connectionMessage: string | null
+  rateLimitsSyncedAt: string | null
+  stale: boolean
+  settings: OverlaySettings
+}
+
 export interface OverlayBridge {
-  getSnapshot: () => Promise<DashboardSnapshot>
-  refresh: () => Promise<DashboardSnapshot>
-  setExpanded: (expanded: boolean) => Promise<DashboardSnapshot>
-  setAlwaysOnTop: (alwaysOnTop: boolean) => Promise<DashboardSnapshot>
-  setStartAtLogin: (startAtLogin: boolean) => Promise<DashboardSnapshot>
+  getSnapshot: () => Promise<QuotaSnapshot>
+  refresh: () => Promise<QuotaSnapshot>
+  setExpanded: (expanded: boolean) => Promise<QuotaSnapshot>
+  setAlwaysOnTop: (alwaysOnTop: boolean) => Promise<QuotaSnapshot>
+  setStartAtLogin: (startAtLogin: boolean) => Promise<QuotaSnapshot>
   hide: () => Promise<void>
   quit: () => Promise<void>
-  onSnapshot: (listener: (snapshot: DashboardSnapshot) => void) => () => void
+  onSnapshot: (listener: (snapshot: QuotaSnapshot) => void) => () => void
 }

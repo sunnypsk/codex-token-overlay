@@ -7,7 +7,6 @@ import type {
   ModelUsageSummary,
   PeriodKey,
   PeriodSummary,
-  QuotaProjection,
   RateLimitBucket,
   RateLimitWindow,
   ResetSummary,
@@ -44,6 +43,8 @@ import {
   startOfHongKongMonth,
   startOfHongKongWeek
 } from './time.js'
+import { estimateQuotaProjection } from '../shared/quota-projection.js'
+export { estimateQuotaProjection } from '../shared/quota-projection.js'
 
 interface ModelAggregateBig extends ContextUsage {
   unknown?: BigTokenBreakdown
@@ -312,52 +313,6 @@ function estimateCurrentCapacity(current: AggregatedCycle | null, usedPercent: n
     sampleCount: 1,
     explanation: 'Current reset-cycle raw-token projection at the observed usage percentage.'
   }
-}
-
-export function estimateQuotaProjection(
-  usedPercent: number | null,
-  startsAtMs: number | null,
-  resetsAtMs: number | null,
-  nowMs = Date.now()
-): QuotaProjection {
-  const unavailable: QuotaProjection = {
-    status: 'unavailable',
-    projectedUsedPercent: null
-  }
-  if (
-    usedPercent === null ||
-    startsAtMs === null ||
-    resetsAtMs === null ||
-    !Number.isFinite(usedPercent) ||
-    !Number.isFinite(startsAtMs) ||
-    !Number.isFinite(resetsAtMs) ||
-    !Number.isFinite(nowMs) ||
-    resetsAtMs <= startsAtMs ||
-    nowMs < startsAtMs ||
-    nowMs >= resetsAtMs
-  ) {
-    return unavailable
-  }
-
-  const normalizedUsedPercent = Math.max(0, usedPercent)
-  if (normalizedUsedPercent === 0) {
-    return { status: 'lasts-until-reset', projectedUsedPercent: 0 }
-  }
-
-  const elapsedMs = nowMs - startsAtMs
-  if (elapsedMs <= 0) return unavailable
-  const elapsedFraction = elapsedMs / (resetsAtMs - startsAtMs)
-  const projection = normalizedUsedPercent / elapsedFraction
-  if (!Number.isFinite(projection)) return unavailable
-
-  const projectedUsedPercent = Math.round(projection * 10) / 10
-  const status =
-    projectedUsedPercent > 100
-      ? 'exhausts-before-reset'
-      : projectedUsedPercent === 100
-        ? 'full-at-reset'
-        : 'lasts-until-reset'
-  return { status, projectedUsedPercent }
 }
 
 function unavailableCurrentWeekEstimate(

@@ -1,9 +1,9 @@
 import { BrowserWindow, screen, type Rectangle } from 'electron'
 import { join } from 'node:path'
-import type { StateStore } from './state.js'
+import type { QuotaStateStore } from './quota-state.js'
 
 const COLLAPSED_SIZE = { width: 340, height: 88 }
-const EXPANDED_SIZE = { width: 380, height: 800 }
+const EXPANDED_SIZE = { width: 380, height: 300 }
 const SCREEN_MARGIN = 20
 
 export class OverlayWindow {
@@ -11,7 +11,7 @@ export class OverlayWindow {
   private allowClose = false
   private moveSaveTimer: NodeJS.Timeout | null = null
 
-  constructor(private readonly store: StateStore) {}
+  constructor(private readonly store: QuotaStateStore) {}
 
   create(): BrowserWindow {
     const state = this.store.get()
