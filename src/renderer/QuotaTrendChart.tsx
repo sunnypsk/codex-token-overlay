@@ -17,7 +17,7 @@ interface Props {
   projection: QuotaProjection
 }
 
-type HoveredTrend = { kind: 'observed'; at: string } | { kind: 'expected'; atMs: number }
+type HoveredTrend = { kind: 'observed'; at: string } | { kind: 'forecast' }
 
 export const QuotaTrendChart = memo(function QuotaTrendChart({ startsAt, resetsAt, observations, projection }: Props): ReactElement {
   const [hovered, setHovered] = useState<HoveredTrend | null>(null)
@@ -43,21 +43,21 @@ export const QuotaTrendChart = memo(function QuotaTrendChart({ startsAt, resetsA
   const segments = segmentGroups.map((segment) => segment.map((point, index) =>
     `${index ? 'L' : 'M'}${x(Date.parse(point.at)).toFixed(2)} ${y(point.usedPercent).toFixed(2)}`
   ).join(' '))
-  const projectedSegments = projectedGroups.map((segment) => segment.map((point, index) =>
-    `${index ? 'L' : 'M'}${x(Date.parse(point.at)).toFixed(2)} ${y(point.projectedUsedPercent!).toFixed(2)}`
-  ).join(' '))
-
   const last = points[points.length - 1]
   const lastAtMs = last ? Date.parse(last.at) : Number.NaN
-  const expectedPath = hasProjection && last
-    ? `M${x(Date.parse(last.at)).toFixed(2)} ${y(last.usedPercent).toFixed(2)} L${RIGHT} ${y(projected).toFixed(2)}`
-    : null
+  const lastHasRecordedProjection = last && typeof last.projectedUsedPercent === 'number' &&
+    Number.isFinite(last.projectedUsedPercent) && last.projectedUsedPercent >= 0
+  const projectedSegments = projectedGroups.map((segment) => {
+    const historyPath = segment.map((point, index) =>
+      `${index ? 'L' : 'M'}${x(Date.parse(point.at)).toFixed(2)} ${y(point.projectedUsedPercent!).toFixed(2)}`
+    ).join(' ')
+    return hasProjection && lastHasRecordedProjection && segment[segment.length - 1] === last
+      ? `${historyPath} L${RIGHT} ${y(projected).toFixed(2)}`
+      : historyPath
+  })
   const hoveredPoint = hovered?.kind === 'observed' ? points.find((point) => point.at === hovered.at) : null
-  const hoveredExpected = hovered?.kind === 'expected' && hasProjection && last
-    ? { atMs: hovered.atMs, usedPercent: last.usedPercent +
-      ((hovered.atMs - lastAtMs) / (reset - lastAtMs)) * (projected - last.usedPercent) }
-    : null
-  const tooltipAtMs = hoveredPoint ? Date.parse(hoveredPoint.at) : hoveredExpected?.atMs
+  const hoveredForecast = hovered?.kind === 'forecast' && hasProjection && lastHasRecordedProjection
+  const tooltipAtMs = hoveredPoint ? Date.parse(hoveredPoint.at) : hoveredForecast ? reset : undefined
   const summary = !validWindow ? 'Waiting for the next reset window' : points.length === 0
     ? 'Waiting for the first observation' :
       `${points.length} observed ${points.length === 1 ? 'reading' : 'readings'}; ${hasProjection ? `expected ${formatProjectedPercent(projected)} by reset` : 'current forecast unavailable'}`
@@ -71,8 +71,8 @@ export const QuotaTrendChart = memo(function QuotaTrendChart({ startsAt, resetsA
       return
     }
     const at = start + ((pointerX - LEFT) / (RIGHT - LEFT)) * (reset - start)
-    if (hasProjection && last && pointerX > x(lastAtMs) + 10) {
-      setHovered({ kind: 'expected', atMs: at })
+    if (hasProjection && lastHasRecordedProjection && pointerX > x(lastAtMs) + 10) {
+      setHovered({ kind: 'forecast' })
       return
     }
     let low = 0
@@ -115,9 +115,8 @@ export const QuotaTrendChart = memo(function QuotaTrendChart({ startsAt, resetsA
             <circle className="trend-projected-isolated-point" key={group[0]!.at}
               cx={x(Date.parse(group[0]!.at))} cy={y(group[0]!.projectedUsedPercent!)} r="3" />
           ))}
-          {expectedPath && <path className="trend-expected" d={expectedPath} />}
           {last && <circle className="trend-last-point" cx={x(Date.parse(last.at))} cy={y(last.usedPercent)} r="3.5" />}
-          {hasProjection && <circle className="trend-expected-point" cx={RIGHT} cy={y(projected)} r="3.5" />}
+          {hasProjection && <circle className="trend-projected-end-point" cx={RIGHT} cy={y(projected)} r="3.5" />}
           {hasProjection && <text className="trend-end-label" x={RIGHT - 5}
             y={Math.max(TOP + 10, y(projected) - 7)} textAnchor="end">{formatProjectedPercent(projected)}</text>}
           {validWindow && <>
@@ -125,8 +124,8 @@ export const QuotaTrendChart = memo(function QuotaTrendChart({ startsAt, resetsA
             <text className="trend-axis" x={RIGHT} y={HEIGHT - 3} textAnchor="end">{formatAxisDate(reset)}</text>
           </>}
           {hoveredPoint && <circle className="trend-hover-point" cx={x(Date.parse(hoveredPoint.at))} cy={y(hoveredPoint.usedPercent)} r="5" />}
-          {hoveredExpected && <circle className="trend-expected-hover-point"
-            cx={x(hoveredExpected.atMs)} cy={y(hoveredExpected.usedPercent)} r="5" />}
+          {hoveredForecast && <circle className="trend-projected-hover-point"
+            cx={RIGHT} cy={y(projected)} r="5" />}
         </svg>
         {tooltipAtMs !== undefined && <div className="trend-tooltip" role="tooltip"
           style={{ left: `${Math.max(20, Math.min(80, x(tooltipAtMs) / WIDTH * 100))}%` }}>
@@ -135,14 +134,13 @@ export const QuotaTrendChart = memo(function QuotaTrendChart({ startsAt, resetsA
             <div>Observed {formatObservedPercent(hoveredPoint.usedPercent)}</div>
             <div>Projected at reset {formatRecordedProjection(hoveredPoint)}</div>
           </>}
-          {hoveredExpected && <div>Expected usage {formatProjectedPercent(hoveredExpected.usedPercent)}</div>}
+          {hoveredForecast && <div>Projected at reset {formatProjectedPercent(projected)}</div>}
         </div>}
         {points.length === 0 && <span className="trend-empty">{summary}</span>}
       </div>
       <div className="trend-footer">
         <span className="trend-legend"><i className="trend-key trend-key--observed" />Observed</span>
         <span className="trend-legend"><i className="trend-key trend-key--projected" />Projected at reset</span>
-        <span className="trend-legend"><i className="trend-key trend-key--expected" />Expected usage</span>
       </div>
       <span className="sr-only">{summary}. Historical forecasts begin with the first sync after this update.</span>
     </section>
