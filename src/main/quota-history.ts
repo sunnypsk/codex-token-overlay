@@ -1,6 +1,18 @@
-import type { QuotaState } from './quota-state.js'
-import { MAX_QUOTA_OBSERVATIONS } from './quota-state.js'
+import type { RateLimitWindow } from '../shared/contracts.js'
+import type { QuotaCycleHistory, QuotaState } from './quota-state.js'
+import { MAX_QUOTA_OBSERVATIONS, RESET_TIME_TOLERANCE_SECONDS } from './quota-state.js'
 import { estimateQuotaProjection } from '../shared/quota-projection.js'
+
+/** Allow small App Server corrections without treating them as a new quota cycle. */
+export function isSameQuotaCycle(
+  history: QuotaCycleHistory | null,
+  limitId: string,
+  window: RateLimitWindow
+): boolean {
+  return history !== null && history.limitId === limitId &&
+    history.windowDurationMins === window.windowDurationMins &&
+    Math.abs(history.resetsAt - window.resetsAt) <= RESET_TIME_TOLERANCE_SECONDS
+}
 
 /** Record only actual successful rate-limit reads in the active primary window. */
 export function recordQuotaObservation(state: QuotaState, observedAtMs: number): void {
@@ -15,8 +27,7 @@ export function recordQuotaObservation(state: QuotaState, observedAtMs: number):
   if (observedAtMs < startsAtMs || observedAtMs >= window.resetsAt * 1_000) return
 
   const history = state.quotaHistory
-  if (!history || history.limitId !== bucket.limitId || history.resetsAt !== window.resetsAt ||
-    history.windowDurationMins !== window.windowDurationMins) {
+  if (!isSameQuotaCycle(history, bucket.limitId, window)) {
     state.quotaHistory = {
       limitId: bucket.limitId,
       resetsAt: window.resetsAt,

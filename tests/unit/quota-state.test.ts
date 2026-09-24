@@ -2,6 +2,7 @@ import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
+import { recordQuotaObservation } from '../../src/main/quota-history.js'
 import { createDefaultQuotaState, QuotaStateStore } from '../../src/main/quota-state.js'
 import { StateStore } from '../../src/main/state.js'
 
@@ -101,5 +102,45 @@ describe('quota state migration', () => {
     await store.save()
     const reloaded = await new QuotaStateStore(quotaPath, join(root, 'unused-legacy.json')).load()
     expect(reloaded.quotaHistory?.observations).toEqual(observations)
+  })
+
+  it('retains a reading near a delayed reset after save and reload', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'codex-quota-reset-jitter-'))
+    roots.push(root)
+    const quotaPath = join(root, 'quota-state.json')
+    const reset = 2_000_000_000
+    const state = createDefaultQuotaState()
+    state.rateLimits = [{ limitId: 'codex', limitName: 'Codex', planType: null,
+      rateLimitReachedType: null, primary: { usedPercent: 27, windowDurationMins: 60, resetsAt: reset },
+      secondary: null }]
+    await writeFile(quotaPath, JSON.stringify(state), 'utf8')
+
+    const store = new QuotaStateStore(quotaPath, join(root, 'unused-legacy.json'))
+    await store.load()
+    store.update((current) => {
+      recordQuotaObservation(current, reset * 1_000 - 60_000)
+      current.rateLimits[0]!.primary!.resetsAt = reset + 1
+      recordQuotaObservation(current, reset * 1_000 + 500)
+    })
+    expect(store.get().quotaHistory?.observations).toHaveLength(2)
+    await store.save()
+
+    const reloaded = new QuotaStateStore(quotaPath, join(root, 'unused-legacy.json'))
+    expect((await reloaded.load()).quotaHistory?.observations).toEqual(store.get().quotaHistory?.observations)
+  })
+
+  it.each([
+    ['malformed JSON', '{bad JSON'],
+    ['invalid history', JSON.stringify({ ...createDefaultQuotaState(), quotaHistory: { limitId: 'codex' } })]
+  ])('leaves an existing quota file intact when it contains %s', async (_description, contents) => {
+    const root = await mkdtemp(join(tmpdir(), 'codex-quota-invalid-'))
+    roots.push(root)
+    const quotaPath = join(root, 'quota-state.json')
+    await writeFile(quotaPath, contents, 'utf8')
+
+    const store = new QuotaStateStore(quotaPath, join(root, 'unused-legacy.json'))
+    await expect(store.load()).rejects.toThrow()
+    await store.save()
+    expect(await readFile(quotaPath, 'utf8')).toBe(contents)
   })
 })

@@ -1,5 +1,6 @@
 import type { ConnectionState, QuotaSnapshot, RateLimitWindow } from '../shared/contracts.js'
 import { estimateQuotaProjection } from '../shared/quota-projection.js'
+import { isSameQuotaCycle } from './quota-history.js'
 import type { QuotaState } from './quota-state.js'
 
 const STALE_AFTER_MS = 2 * 60_000
@@ -22,8 +23,8 @@ export function buildQuotaSnapshot(
   const resetMs = window === null ? null : window.resetsAt * 1_000
   const startMs = window === null ? null : resetMs! - window.windowDurationMins * 60_000
   const history = state.quotaHistory
-  const observations = window && history && history.limitId === primaryBucket?.limitId &&
-    history.resetsAt === window.resetsAt && history.windowDurationMins === window.windowDurationMins
+  const observations = window && history && primaryBucket &&
+    isSameQuotaCycle(history, primaryBucket.limitId, window)
     ? history.observations.map((point) => ({ ...point })) : []
   const latestAtMs = observations.length > 0
     ? Date.parse(observations[observations.length - 1]!.at) : syncedAtMs

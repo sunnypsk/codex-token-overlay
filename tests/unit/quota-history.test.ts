@@ -69,6 +69,22 @@ describe('quota observations', () => {
     expect(state.quotaHistory?.observations).toHaveLength(1)
   })
 
+  it('keeps the same cycle when the reset timestamp moves by a second', () => {
+    const state = stateWithWindow()
+    recordQuotaObservation(state, start + 60_000)
+    const first = state.quotaHistory!.observations[0]
+
+    state.rateLimits[0]!.primary!.resetsAt = reset + 1
+    recordQuotaObservation(state, start + 120_000)
+    expect(state.quotaHistory?.observations).toHaveLength(2)
+    expect(state.quotaHistory?.observations[0]).toEqual(first)
+
+    state.rateLimits[0]!.primary!.resetsAt = reset
+    recordQuotaObservation(state, start + 180_000)
+    expect(state.quotaHistory?.observations).toHaveLength(3)
+    expect(state.quotaHistory?.resetsAt).toBe(reset)
+  })
+
   it('ignores invalid or expired windows without inventing observations', () => {
     const state = stateWithWindow()
     recordQuotaObservation(state, start - 1)

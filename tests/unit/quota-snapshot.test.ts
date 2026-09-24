@@ -61,6 +61,21 @@ describe('quota snapshot', () => {
     expect(buildQuotaSnapshot(old, { appServer: 'online', message: null }, now).reset.projection.status).toBe('unavailable')
   })
 
+  it('shows existing observations while the reset timestamp shifts by a second', () => {
+    const state = stateWithLimits()
+    const observation = { at: new Date(now - 20_000).toISOString(), usedPercent: 25, projectedUsedPercent: 50 }
+    state.quotaHistory = { limitId: 'codex', resetsAt: resetSeconds, windowDurationMins: weekMinutes,
+      observations: [observation] }
+    state.rateLimits[0]!.primary!.resetsAt = resetSeconds + 1
+
+    expect(buildQuotaSnapshot(state, { appServer: 'online', message: null }, now).reset.observations)
+      .toEqual([observation])
+
+    state.rateLimits[0]!.primary!.resetsAt = resetSeconds + 3600
+    expect(buildQuotaSnapshot(state, { appServer: 'online', message: null }, now).reset.observations)
+      .toEqual([])
+  })
+
   it('hides expired and missing windows instead of showing a false zero', () => {
     const expired = buildQuotaSnapshot(stateWithLimits(), { appServer: 'online', message: null }, resetSeconds * 1_000)
     expect(expired.reset.usedPercent).toBeNull()

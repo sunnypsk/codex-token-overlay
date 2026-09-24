@@ -22,6 +22,7 @@ export interface QuotaCycleHistory {
 }
 
 export const MAX_QUOTA_OBSERVATIONS = 10_080
+export const RESET_TIME_TOLERANCE_SECONDS = 60
 
 export function createDefaultQuotaState(): QuotaState {
   return {
@@ -41,6 +42,7 @@ export class QuotaStateStore {
   private saving: Promise<void> | null = null
   private revision = 0
   private savedRevision = -1
+  private loaded = false
 
   constructor(
     private readonly filePath: string,
@@ -48,16 +50,20 @@ export class QuotaStateStore {
   ) {}
 
   async load(): Promise<QuotaState> {
+    this.loaded = false
+    let contents: string | null = null
     try {
-      const parsed = normalizeQuotaState(JSON.parse(await readFile(this.filePath, 'utf8')))
-      if (parsed) {
-        this.state = parsed
-        this.savedRevision = this.revision
-        return this.state
-      }
-      console.warn('Invalid quota state; trying legacy settings')
+      contents = await readFile(this.filePath, 'utf8')
     } catch (error) {
-      if (!isMissingFile(error)) console.warn('Unable to load quota state:', error)
+      if (!isMissingFile(error)) throw error
+    }
+    if (contents !== null) {
+      const parsed = normalizeQuotaState(JSON.parse(contents))
+      if (!parsed) throw new Error(`Invalid quota state: ${this.filePath}`)
+      this.state = parsed
+      this.savedRevision = this.revision
+      this.loaded = true
+      return this.state
     }
 
     const legacy = await new StateStore(this.legacyFilePath).load()
@@ -69,6 +75,7 @@ export class QuotaStateStore {
       rateLimitsSyncedAt: validTimestamp(legacy.rateLimitsSyncedAt),
       quotaHistory: null
     }
+    this.loaded = true
     await this.save()
     return this.state
   }
@@ -93,6 +100,7 @@ export class QuotaStateStore {
   }
 
   async save(): Promise<void> {
+    if (!this.loaded) return
     if (this.saveTimer) clearTimeout(this.saveTimer)
     this.saveTimer = null
     while (this.savedRevision < this.revision) {
@@ -132,6 +140,9 @@ function normalizeQuotaState(value: unknown): QuotaState | null {
     !validCoordinate(window.x) || !validCoordinate(window.y) ||
     !Array.isArray(value.rateLimits)
   ) return null
+  const quotaHistory = value.quotaHistory == null ? null : normalizeQuotaHistory(value.quotaHistory)
+  if (value.quotaHistory != null && !quotaHistory) return null
+
   return {
     version: 1,
     settings: {
@@ -142,7 +153,7 @@ function normalizeQuotaState(value: unknown): QuotaState | null {
     window: { x: window.x as number | null, y: window.y as number | null },
     rateLimits: normalizeRateLimits(value.rateLimits),
     rateLimitsSyncedAt: validTimestamp(value.rateLimitsSyncedAt),
-    quotaHistory: normalizeQuotaHistory(value.quotaHistory)
+    quotaHistory
   }
 }
 
@@ -153,12 +164,14 @@ function normalizeQuotaHistory(value: unknown): QuotaCycleHistory | null {
     value.windowDurationMins <= 0 || !Array.isArray(value.observations)) return null
 
   const startsAt = value.resetsAt * 1_000 - value.windowDurationMins * 60_000
+  const boundaryToleranceMs = RESET_TIME_TOLERANCE_SECONDS * 1_000
   const observations: QuotaObservation[] = []
   for (const point of value.observations.slice(-MAX_QUOTA_OBSERVATIONS)) {
     if (!isRecord(point) || typeof point.at !== 'string' || typeof point.usedPercent !== 'number' ||
       !Number.isFinite(point.usedPercent) || point.usedPercent < 0) continue
     const atMs = Date.parse(point.at)
-    if (!Number.isFinite(atMs) || atMs < startsAt || atMs >= value.resetsAt * 1_000 ||
+    if (!Number.isFinite(atMs) || atMs < startsAt - boundaryToleranceMs ||
+      atMs >= value.resetsAt * 1_000 + boundaryToleranceMs ||
       (observations.length > 0 && atMs <= Date.parse(observations[observations.length - 1]!.at))) continue
     const normalized: QuotaObservation = { at: new Date(atMs).toISOString(), usedPercent: point.usedPercent }
     if ('projectedUsedPercent' in point) {
