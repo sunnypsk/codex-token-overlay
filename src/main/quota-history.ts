@@ -1,5 +1,6 @@
 import type { QuotaState } from './quota-state.js'
 import { MAX_QUOTA_OBSERVATIONS } from './quota-state.js'
+import { estimateQuotaProjection } from '../shared/quota-projection.js'
 
 /** Record only actual successful rate-limit reads in the active primary window. */
 export function recordQuotaObservation(state: QuotaState, observedAtMs: number): void {
@@ -27,7 +28,13 @@ export function recordQuotaObservation(state: QuotaState, observedAtMs: number):
   const observations = state.quotaHistory!.observations
   const last = observations[observations.length - 1]
   if (last && observedAtMs < Date.parse(last.at)) return
-  const point = { at: new Date(observedAtMs).toISOString(), usedPercent: window.usedPercent }
+  const point = {
+    at: new Date(observedAtMs).toISOString(),
+    usedPercent: window.usedPercent,
+    projectedUsedPercent: estimateQuotaProjection(
+      window.usedPercent, startsAtMs, window.resetsAt * 1_000, observedAtMs
+    ).projectedUsedPercent
+  }
   if (last && Math.floor(Date.parse(last.at) / 60_000) === Math.floor(observedAtMs / 60_000)) {
     observations[observations.length - 1] = point
   } else {

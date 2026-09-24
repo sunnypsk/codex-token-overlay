@@ -160,7 +160,13 @@ function normalizeQuotaHistory(value: unknown): QuotaCycleHistory | null {
     const atMs = Date.parse(point.at)
     if (!Number.isFinite(atMs) || atMs < startsAt || atMs >= value.resetsAt * 1_000 ||
       (observations.length > 0 && atMs <= Date.parse(observations[observations.length - 1]!.at))) continue
-    observations.push({ at: new Date(atMs).toISOString(), usedPercent: point.usedPercent })
+    const normalized: QuotaObservation = { at: new Date(atMs).toISOString(), usedPercent: point.usedPercent }
+    if ('projectedUsedPercent' in point) {
+      normalized.projectedUsedPercent = typeof point.projectedUsedPercent === 'number' &&
+        Number.isFinite(point.projectedUsedPercent) && point.projectedUsedPercent >= 0
+        ? point.projectedUsedPercent : null
+    }
+    observations.push(normalized)
   }
   return { limitId: value.limitId, resetsAt: value.resetsAt,
     windowDurationMins: value.windowDurationMins, observations }

@@ -74,4 +74,32 @@ describe('quota state migration', () => {
     const loaded = await new QuotaStateStore(quotaPath, legacyPath).load()
     expect(loaded.quotaHistory?.observations).toEqual([{ at: '2033-05-18T00:00:00.000Z', usedPercent: 27 }])
   })
+
+  it('keeps recorded forecasts through reload without filling older observations', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'codex-quota-projection-'))
+    roots.push(root)
+    const quotaPath = join(root, 'quota-state.json')
+    const state = createDefaultQuotaState()
+    state.quotaHistory = { limitId: 'codex', resetsAt: 2_000_000_000, windowDurationMins: 10_080,
+      observations: [
+        { at: '2033-05-18T00:00:00.000Z', usedPercent: 27 },
+        { at: '2033-05-18T00:01:00.000Z', usedPercent: 40, projectedUsedPercent: 160 },
+        { at: '2033-05-18T00:02:00.000Z', usedPercent: 41, projectedUsedPercent: -5 },
+        { at: '2033-05-18T00:03:00.000Z', usedPercent: 42, projectedUsedPercent: null }
+      ] }
+    await writeFile(quotaPath, JSON.stringify(state), 'utf8')
+
+    const store = new QuotaStateStore(quotaPath, join(root, 'unused-legacy.json'))
+    const observations = (await store.load()).quotaHistory?.observations
+    expect(observations).toEqual([
+      { at: '2033-05-18T00:00:00.000Z', usedPercent: 27 },
+      { at: '2033-05-18T00:01:00.000Z', usedPercent: 40, projectedUsedPercent: 160 },
+      { at: '2033-05-18T00:02:00.000Z', usedPercent: 41, projectedUsedPercent: null },
+      { at: '2033-05-18T00:03:00.000Z', usedPercent: 42, projectedUsedPercent: null }
+    ])
+    store.update((current) => { current.settings.expanded = true })
+    await store.save()
+    const reloaded = await new QuotaStateStore(quotaPath, join(root, 'unused-legacy.json')).load()
+    expect(reloaded.quotaHistory?.observations).toEqual(observations)
+  })
 })

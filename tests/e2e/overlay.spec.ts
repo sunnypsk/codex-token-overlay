@@ -11,7 +11,9 @@ test('shows only quota percentages in both overlay sizes', async ({}, testInfo) 
   const observations = [
     { at: new Date(now - 29 * 60_000).toISOString(), usedPercent: 2.5 },
     ...Array.from({ length: 24 }, (_, index) => ({
-      at: new Date(now - (23 - index) * 60_000).toISOString(), usedPercent: (index + 1) * 3.125
+      at: new Date(now - (23 - index) * 60_000).toISOString(),
+      usedPercent: (index + 1) * 3.125,
+      projectedUsedPercent: index === 12 ? null : Math.round((index + 1) * 3.125 * 60 / (index + 7) * 10) / 10
     }))
   ]
   await writeFile(resolve(userDataPath, 'quota-state.json'), JSON.stringify({
@@ -56,13 +58,15 @@ test('shows only quota percentages in both overlay sizes', async ({}, testInfo) 
     await expect(page.getByRole('img', { name: /Codex quota used percentage trend/ })).toBeVisible()
     await expect(page.locator('.trend-observed')).toHaveCount(2)
     await expect(page.locator('.trend-isolated-point')).toHaveCount(1)
-    await expect(page.locator('.trend-projected')).toHaveCount(1)
+    await expect(page.locator('.trend-projected')).toHaveCount(2)
+    await expect(page.locator('.trend-expected')).toHaveCount(1)
     await expect(page.locator('.trend-end-label')).toContainText('%')
     const graphForecast = (await page.locator('.trend-end-label').textContent()) ?? ''
     expect(Number.parseFloat(graphForecast)).toBeGreaterThan(100)
     await expect(page.locator('.projection-row strong')).toContainText(graphForecast)
     await expect(page.getByText('Observed', { exact: true })).toBeVisible()
-    await expect(page.getByText('Projected', { exact: true })).toBeVisible()
+    await expect(page.getByText('Projected at reset', { exact: true })).toBeVisible()
+    await expect(page.getByText('Expected usage', { exact: true })).toBeVisible()
     await expect(page.getByRole('button', { name: 'Refresh' })).toBeVisible()
     await expect(page.locator('body')).not.toContainText(/token|pricing|cost|model|today/i)
     const expanded = await electronApp.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]?.getBounds())
@@ -86,9 +90,15 @@ test('shows only quota percentages in both overlay sizes', async ({}, testInfo) 
     await page.screenshot({ path: testInfo.outputPath('expanded-overlay.png') })
 
     await page.locator('.trend-last-point').hover({ force: true })
-    await expect(page.getByRole('tooltip')).toContainText('75%')
+    await expect(page.getByRole('tooltip')).toContainText('Observed 75%')
+    await expect(page.getByRole('tooltip')).toContainText(`Projected at reset ${graphForecast}`)
     await expect(page.getByRole('tooltip')).toContainText('HKT')
     await page.screenshot({ path: testInfo.outputPath('trend-tooltip.png') })
+
+    await page.locator('.trend-isolated-point').hover({ force: true })
+    await expect(page.getByRole('tooltip')).toContainText('Projected at reset Not recorded')
+    await page.locator('.trend-expected-point').hover({ force: true })
+    await expect(page.getByRole('tooltip')).toContainText(`Expected usage ${graphForecast}`)
 
     await page.getByRole('button', { name: 'Refresh' }).click()
     await expect(page.locator('.spin')).toHaveCount(0, { timeout: 20_000 })
@@ -100,5 +110,10 @@ test('shows only quota percentages in both overlay sizes', async ({}, testInfo) 
 
   const saved = JSON.parse(await readFile(resolve(userDataPath, 'quota-state.json'), 'utf8')) as Record<string, unknown>
   expect(Object.keys(saved).sort()).toEqual(['quotaHistory', 'rateLimits', 'rateLimitsSyncedAt', 'settings', 'version', 'window'])
-  expect((saved.quotaHistory as { observations: unknown[] }).observations.length).toBeGreaterThanOrEqual(3)
+  const savedObservations = (saved.quotaHistory as {
+    observations: Array<{ at: string; usedPercent: number; projectedUsedPercent?: number | null }>
+  }).observations
+  expect(savedObservations.length).toBeGreaterThanOrEqual(3)
+  expect(savedObservations[0]).not.toHaveProperty('projectedUsedPercent')
+  expect(typeof savedObservations[savedObservations.length - 1]?.projectedUsedPercent).toBe('number')
 })

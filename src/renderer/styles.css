@@ -103,17 +103,19 @@ button { font: inherit; }
 .trend-axis { fill: var(--muted); font-size: 9px; font-family: inherit; }
 .trend-end-label { fill: var(--accent); font-size: 10px; font-weight: 700; font-family: inherit; }
 .trend-observed { fill: none; stroke: var(--accent-2); stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; }
-.trend-projected { fill: none; stroke: var(--accent); stroke-width: 2; stroke-dasharray: 5 5; }
+.trend-projected { fill: none; stroke: var(--accent); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.trend-expected { fill: none; stroke: var(--accent); stroke-width: 2; stroke-dasharray: 5 5; }
 .trend-last-point, .trend-isolated-point, .trend-hover-point { fill: var(--accent-2); stroke: #141923; stroke-width: 1.5; }
-.trend-projected-point { fill: var(--accent); stroke: #141923; stroke-width: 1.5; }
+.trend-projected-isolated-point, .trend-expected-point, .trend-expected-hover-point { fill: var(--accent); stroke: #141923; stroke-width: 1.5; }
 .trend-tooltip { position: absolute; top: 10px; z-index: 1; transform: translateX(-50%); padding: 5px 7px; color: var(--text); background: #252b3b; border: 1px solid var(--border); border-radius: 7px; font-size: 10px; white-space: nowrap; pointer-events: none; box-shadow: 0 4px 14px rgba(0,0,0,0.3); }
+.trend-tooltip > div + div { margin-top: 2px; }
 .trend-empty { position: absolute; left: 42px; right: 8px; top: 50%; transform: translateY(-50%); color: var(--muted); font-size: 11px; text-align: center; pointer-events: none; }
-.trend-footer { display: flex; align-items: center; gap: 12px; margin: -1px 2px 0; color: var(--muted); font-size: 10px; }
+.trend-footer { display: flex; align-items: center; justify-content: space-between; gap: 5px; margin: -1px 2px 0; color: var(--muted); font-size: 9px; white-space: nowrap; }
 .trend-legend { display: inline-flex; align-items: center; gap: 5px; }
-.trend-key { display: inline-block; width: 13px; height: 0; border-top: 2px solid; }
+.trend-key { display: inline-block; width: 11px; height: 0; border-top: 2px solid; }
 .trend-key--observed { border-color: var(--accent-2); }
-.trend-key--projected { border-color: var(--accent); border-top-style: dashed; }
-.trend-summary { margin-left: auto; }
+.trend-key--projected { border-color: var(--accent); }
+.trend-key--expected { border-color: var(--accent); border-top-style: dashed; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 .secondary-limits { display: flex; flex-direction: column; gap: 5px; margin-top: 6px; }
 .secondary-limits > div { display: flex; justify-content: space-between; gap: 8px; padding: 6px 8px; border: 1px solid var(--border); border-radius: 9px; color: var(--muted); font-size: 10px; background: var(--panel); }

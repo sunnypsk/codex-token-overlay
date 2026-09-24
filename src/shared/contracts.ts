@@ -133,6 +133,8 @@ export interface QuotaProjection {
 export interface QuotaObservation {
   at: string
   usedPercent: number
+  /** Forecast at this sync for the end of the active reset window; absent in older history. */
+  projectedUsedPercent?: number | null
 }
 
 export interface CurrentWeekEstimate {

@@ -22,9 +22,32 @@ describe('quota observations', () => {
     state.rateLimits[0]!.primary!.usedPercent = 18
     recordQuotaObservation(state, start + 121_000)
     expect(state.quotaHistory?.observations).toEqual([
-      { at: new Date(start + 95_000).toISOString(), usedPercent: 12 },
-      { at: new Date(start + 121_000).toISOString(), usedPercent: 18 }
+      { at: new Date(start + 95_000).toISOString(), usedPercent: 12, projectedUsedPercent: 454.7 },
+      { at: new Date(start + 121_000).toISOString(), usedPercent: 18, projectedUsedPercent: 535.5 }
     ])
+  })
+
+  it('keeps each sync\'s reset forecast when later usage changes', () => {
+    const state = stateWithWindow()
+    state.rateLimits[0]!.primary!.usedPercent = 40
+    recordQuotaObservation(state, start + 15 * 60_000)
+    state.rateLimits[0]!.primary!.usedPercent = 60
+    recordQuotaObservation(state, start + 30 * 60_000)
+    expect(state.quotaHistory?.observations).toEqual([
+      { at: new Date(start + 15 * 60_000).toISOString(), usedPercent: 40, projectedUsedPercent: 160 },
+      { at: new Date(start + 30 * 60_000).toISOString(), usedPercent: 60, projectedUsedPercent: 120 }
+    ])
+  })
+
+  it('records zero usage and an unavailable projection at the exact window start', () => {
+    const state = stateWithWindow()
+    recordQuotaObservation(state, start)
+    expect(state.quotaHistory?.observations[0]?.projectedUsedPercent).toBe(0)
+    state.rateLimits[0]!.primary!.usedPercent = 1
+    recordQuotaObservation(state, start)
+    expect(state.quotaHistory?.observations[0]?.projectedUsedPercent).toBeNull()
+    recordQuotaObservation(state, start + 30_000)
+    expect(state.quotaHistory?.observations[0]?.projectedUsedPercent).toBe(120)
   })
 
   it('starts a fresh history when the reset or window duration changes', () => {

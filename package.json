@@ -1,6 +1,6 @@
 {
   "name": "codex-token-overlay",
-  "version": "0.1.12",
+  "version": "0.1.13",
   "description": "A Windows always-on-top overlay for Codex usage percentages and reset windows.",
   "main": "out/main/index.js",
   "type": "module",

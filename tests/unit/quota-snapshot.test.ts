@@ -52,7 +52,7 @@ describe('quota snapshot', () => {
 
     const withHistory = stateWithLimits()
     withHistory.quotaHistory = { limitId: 'codex', resetsAt: resetSeconds, windowDurationMins: weekMinutes,
-      observations: [{ at: new Date(now - 20_000).toISOString(), usedPercent: 25 }] }
+      observations: [{ at: new Date(now - 20_000).toISOString(), usedPercent: 25, projectedUsedPercent: 50 }] }
     expect(buildQuotaSnapshot(withHistory, { appServer: 'offline', message: 'Disconnected' }, now).reset.observations)
       .toEqual(withHistory.quotaHistory.observations)
 
