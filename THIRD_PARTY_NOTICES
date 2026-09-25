@@ -1,5 +1,12 @@
 Codex Token Overlay pricing snapshot
 
+Native runtime JSON parser
+  nlohmann/json 3.12.0
+  Source: https://github.com/nlohmann/json/releases/tag/v3.12.0
+  License: MIT; full license in native/third_party/nlohmann/LICENSE.MIT.
+  Header provenance and checksum: native/third_party/README.md.
+  The pricing snapshots below belong to the retained Electron implementation.
+
 ccusage
   Reference: ccusage@914b4f4a562040fa0c4bf8d4dc7f3ae27d70e73c
   Source: https://github.com/ryoppippi/ccusage/tree/914b4f4a562040fa0c4bf8d4dc7f3ae27d70e73c

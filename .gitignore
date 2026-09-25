@@ -9,3 +9,14 @@ test-results/
 *.tsbuildinfo
 .DS_Store
 Thumbs.db
+
+# Local credentials and runtime state must never be published.
+.env
+.env.*
+!.env.example
+auth.json
+credentials.json
+*.pem
+*.key
+quota-state.json*
+usage-state.json*

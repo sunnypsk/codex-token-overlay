@@ -1,96 +1,127 @@
 # Codex Token Overlay
 
-## Native Windows version (0.2.0)
+A lightweight Windows overlay for Codex quota percentages, reset countdowns and usage forecasts. The current **v0.2.0 native version** uses C++20, Win32, Direct2D and DirectWrite. It does not ship Electron, Node.js or WebView. The earlier Electron v0.1.15 source remains available for comparison and rollback.
 
-The native implementation uses C++20, Win32, Direct2D and DirectWrite. It retains
-the English quota UI, history, forecasts and tray controls with a solid dark
-background. The Electron implementation and its 0.1.15 installer remain the
-fallback. Native code is in `native/`; the shipped program has no Electron,
-Node.js or WebView runtime. Node is used only for development tests and packaging.
+This is an independent project, not an official OpenAI product. A working, signed-in Codex installation with `codex app-server` support is required; the overlay does not include Codex or provide an account.
 
-Build prerequisites: Visual Studio 2022 Build Tools with MSVC v143 x64, Windows
-SDK 10.0.26100 and C++ CMake tools. The checked-in JSON header is pinned to 3.12.0
-and its license and official checksum are documented in `native/third_party/`.
+![Collapsed native overlay with synthetic quota data](docs/images/native-collapsed.png)
+
+<details>
+<summary>Expanded view (synthetic test data)</summary>
+
+![Expanded native overlay with synthetic quota data](docs/images/native-expanded.png)
+
+</details>
+
+## Features
+
+- Current quota percentage, reset countdown and reset time in HKT (UTC+8).
+- Estimated quota usage at reset, recorded observations and historical forecasts.
+- Additional quota buckets, chart tooltips, manual refresh and automatic reconnect.
+- Always-on-top mode, dragging, system tray, hide/restore and optional Start with Windows.
+- Per-monitor DPI support; centered ring percentage and a shared expand/collapse button position.
+- Compact 340 x 88 DIP view. Expanded view is 380 DIP wide and 460/480/500 DIP tall, depending on additional quota rows.
+
+Quota data refreshes every minute and on App Server notifications. The forecast extrapolates the current reset window's average consumption pace; it is an estimate, not a guarantee of future usage. Unknown or expired values show N/A. Offline or stale data retains recorded history but hides the current forecast extension.
+
+## Build the native version
+
+Use Windows x64 with:
+
+- Visual Studio 2022 Build Tools: MSVC v143 x64, Windows SDK 10.0.26100 and C++ CMake tools (CMake 3.25+).
+- Node.js (tested with 24.19.0) and pnpm 10.7.1 for icon generation, cross-language tests and NSIS packaging. These are development tools, not runtime requirements of the native EXE.
+- A signed-in Codex installation for live quota reads.
+
+Run from the repository root in PowerShell:
+
+```powershell
+pnpm install --frozen-lockfile
+node scripts/generate-icon.mjs
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-native.ps1 -Test
+& '.\build\native\Release\Codex Token Overlay.exe'
+```
+
+Close any older overlay before starting against the same profile. Codex is discovered from its local app installation or `PATH`; you can explicitly select it for the current shell:
+
+```powershell
+$env:CODEX_EXECUTABLE = 'C:\path\to\codex.exe'
+```
+
+The checked-in `nlohmann/json` 3.12.0 header has pinned provenance, SHA256 and license in [native/third_party](native/third_party/README.md). The Release binary uses the static C++ runtime.
+
+## Package and install
+
+After generating the icon and installing development dependencies:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-native.ps1
+```
+
+Outputs:
+
+- `release/native/win-unpacked/Codex Token Overlay.exe`
+- `release/native/Codex-Token-Overlay-0.2.0-Setup.exe`
+
+Packaging does not install or launch an upgrade. The NSIS installer is per-user and unsigned. Close the old overlay, then run the installer to update it. Generated installers are excluded from Git; build locally unless a binary has been explicitly published as a GitHub release asset.
+
+The product/App ID and startup entry remain `com.local.codextokenoverlay`. The native executable and Electron version share an exclusive profile lock to prevent simultaneous writes. Unrelated Codex processes are not terminated.
+
+## Data, privacy and rollback
+
+The active runtime reads `account/rateLimits/read` from one local Codex App Server over JSON-RPC. It does not scan conversation/session files, request account token usage, or refresh pricing. Legacy session/pricing code remains in the Electron source for compatibility and tests.
+
+Settings, position, quota snapshots and history live in `%APPDATA%\codex-token-overlay\quota-state.json` (schema v1). The overlay uses Codex's existing authentication through App Server; it does not ask you to paste credentials into the overlay. App Server retains its own Codex authentication and network behavior.
+
+- History stores at most one observation per minute, up to 10,080 observations, for the active primary reset window.
+- Chart lines break across gaps longer than two minutes or missing forecasts. Older observations without forecasts remain readable.
+- First native replacement saves `quota-state.json.pre-native.bak`; subsequent writes use a flushed temporary file and atomic replacement. Invalid data is reported without overwriting the original.
+- Legacy usage state is read only for migration. Existing files are preserved.
+- Position uses Electron-compatible DIP coordinates plus optional native monitor metadata; v0.1.15 ignores that metadata.
+
+For rollback, close the native overlay and reinstall your retained v0.1.15 installer. The v1 data remains readable by that version. Back up your current data before manually restoring an older snapshot, which would discard newer history.
+
+Do not commit local credentials, `.env` files, quota state, logs or diagnostic captures. Build outputs, installers, test profiles and raw measurements are excluded by `.gitignore`.
+
+## Validation and resource measurements
+
+The measured pre-layout-fix native build used **26.89 MiB / 33.02 MiB / 31.58 MiB peak combined Private Working Set** in collapsed / expanded / hidden states, including its real App Server and conhost. Each state was sampled for ten minutes after two minutes of warmup. Mean machine CPU was below 0.01%. These are measurements on one Windows x64 machine, not a guarantee for every system or Codex version.
+
+The later layout fix passed core tests and UI checks at synthetic 100%, 150% and 200% DPI. The full resource run was not repeated for that layout-only revision. See [validation details and limits](docs/VALIDATION.md).
+
+Core, TypeScript parity and UI checks:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-native.ps1 -Test
 $env:NATIVE_TEST_EXE = (Resolve-Path 'build/native/Release/overlay_tests.exe').Path
-node node_modules/vitest/vitest.mjs run tests/unit/native-parity.test.ts
+pnpm test
+pnpm typecheck
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-native-ui.ps1
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-native.ps1
 ```
 
-The EXE and per-user NSIS installer are written to `release/native/`. Packaging
-does not install the application. Close the older overlay before running the
-native version against the normal profile. The product/App ID and startup entry
-remain `com.local.codextokenoverlay`. Native startup refuses to share the normal
-profile with a running older overlay. Both versions use the same exclusive
-Windows `lockfile`, so starting the older version while native is running also
-refuses a second writer. No unrelated Codex process is terminated.
-
-State stays in `%APPDATA%/codex-token-overlay/quota-state.json`, using the existing
-v1 schema. The first replacement creates `quota-state.json.pre-native.bak`;
-writes use a flushed temporary file and atomic replacement. Invalid quota data
-is reported instead of overwritten. Legacy usage state is read only for migration.
-Window x/y remain Electron-compatible DIP coordinates. An optional native monitor
-anchor avoids ambiguity when mixed-DPI monitors have overlapping DIP bounds;
-v0.1.15 ignores that extra metadata and still reads the standard position fields.
-To roll back, close the native version and reinstall the retained 0.1.15 installer;
-the existing schema remains readable by that version.
-
-The quota helper runs inside a Windows Job Object, with `TOKIO_WORKER_THREADS=2`
-set only in its child environment. Authentication and Codex configuration remain
-inherited. The helper is reused between polls and reclaimed on reconnect/exit.
-
-Tests require both `CODEX_OVERLAY_E2E=1` and `CODEX_OVERLAY_E2E_USER_DATA` before
-using an isolated profile or fixture. They never change the actual startup entry.
-Native UI tests cover UI Automation InvokePattern and **synthetic** 96/144/192 DPI
-messages; physical multi-monitor DPI transitions need separate device evidence.
-
-Resource acceptance uses the packaged Release EXE with the real quota helper:
-two-minute warmup, ten minutes each collapsed/expanded/hidden, five-second
-sampling, combined Private Working Set <=50 MiB and mean machine CPU <=0.1%.
-The separate fixture soak runs 30 minutes by default (`-SoakMinutes 60` for one hour) and 100 hide/show cycles, records handles
-and GDI/USER resources, and checks for orphaned children. No working-set trimming
-is used. Raw samples and binary hashes are saved under `test-results/`.
+UI and measurement scripts create isolated profiles from an existing local overlay state. Run the overlay at least once first, and keep the desktop unlocked during visible tests. They do not change the real startup entry. Isolated operation requires both `CODEX_OVERLAY_E2E=1` and `CODEX_OVERLAY_E2E_USER_DATA`; the scripts set these automatically.
 
 ```powershell
 $exe = (Resolve-Path 'release/native/win-unpacked/Codex Token Overlay.exe').Path
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/measure-native.ps1 -Executable $exe -Mode performance
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/measure-native.ps1 -Executable $exe -Mode soak
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/measure-native.ps1 -Executable $exe -Mode soak -SoakMinutes 30
 ```
 
-A compact Windows overlay for Codex quota percentages. It shows the current Codex usage percentage, the reset countdown and time, a current-window percentage forecast, and percentages for other available limits. Expanding the overlay shows observed percentage history and a connected line of recorded forecasts of usage at reset, extended to the current reset estimate. The overlay can be collapsed, pinned above other windows, and controlled from the system tray.
+Performance mode measures all owned processes every five seconds and requires every stable sample <=50 MiB Private Working Set and mean machine CPU <=0.1%. The separate fixed-data soak performs 100 hide/show cycles and records RAM, handles and GDI/USER resources; use `-SoakMinutes 60` for one hour. No forced working-set trimming is used. Raw results and tested binary hashes remain local under `test-results/`.
 
-The active service reads `account/rateLimits/read` from the local Codex App Server every minute and when Codex reports a limit change. Manual refresh and reconnect remain available. It does not request account token usage, scan local session files, or refresh pricing.
+## Retained Electron implementation
 
-## Updating from 0.1.9
-
-Version 0.1.11 stores only overlay settings, window position, and recent rate limits in `quota-state.json`. On first launch it reads the existing usage state to copy those values. The previous usage files are left untouched, so an older installation can still use them.
-
-If Codex is offline, a still-active cached percentage is marked as last synced; its forecast is unavailable. Once the cached reset time has passed, the percentage and reset display become unavailable until Codex supplies a new window. A missing percentage is never shown as 0%.
-
-Observed trend history begins with the first successful sync after the trend was introduced. Each successful sync now saves the forecast made at that timestamp for the end of the active reset window. Earlier observed readings remain visible, but their historical forecasts are shown as not recorded. One reading per minute is stored in `quota-state.json` for the active primary reset window. Solid lines break when readings are more than two minutes apart; missing forecasts also break the historical forecast line. The latest recorded forecast connects to the current reset estimate; this extension is a guide to the reset value, not an estimate of cumulative usage at intermediate times. An offline or stale overlay keeps both recorded histories visible but hides the extension until sync resumes.
-
-The application ID and installer name remain `Codex Token Overlay` for upgrade compatibility.
-
-## Development
+`package.json` stays at **0.1.15** for the Electron fallback; native CMake/resources and `electron-builder.native.json` define **0.2.0**. The two build paths are intentional.
 
 ```powershell
-pnpm install
+pnpm install --frozen-lockfile
 pnpm dev
-```
-
-Validation and packaging:
-
-```powershell
-pnpm typecheck
-pnpm test
 pnpm build
 pnpm dist
 pnpm test:e2e
 ```
 
-The NSIS installer is written to `release/`. Local installers are unsigned.
+`pnpm dist` builds the Electron installer under `release/`; `pnpm dist:native` builds the native installer under `release/native/`.
 
-The forecast extrapolates the current reset window's average percentage-consumption pace. It is an estimate and can change as usage changes.
+## License
+
+[MIT](LICENSE). See [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES) and the vendored JSON license for third-party components.
