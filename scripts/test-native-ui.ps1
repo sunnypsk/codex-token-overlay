@@ -9,6 +9,11 @@ $cursor=New-Object OverlayNativeTest+Point
 [void][OverlayNativeTest]::GetCursorPos([ref]$cursor)
 $checks=New-Object System.Collections.Generic.List[string]
 function Assert-Native([bool]$Value,[string]$Message){if(-not $Value){throw $Message};$checks.Add($Message)}
+function Get-ToggleBounds([string]$Name){
+  $root=[System.Windows.Automation.AutomationElement]::FromHandle($app.Window)
+  $condition=New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty,$Name)
+  return $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$condition).Current.BoundingRectangle
+}
 function Invoke-NativeButton([string]$Name){
   $root=[System.Windows.Automation.AutomationElement]::FromHandle($app.Window)
   $condition=New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty,$Name)
@@ -25,13 +30,17 @@ try {
     $bounds=New-Object OverlayNativeTest+Rect
     [void][OverlayNativeTest]::GetWindowRect($app.Window,[ref]$bounds)
     Assert-Native (($bounds.Right-$bounds.Left) -eq (380*$dpi/96)) "Expanded width at synthetic DPI $dpi"
-    Assert-Native (($bounds.Bottom-$bounds.Top) -eq (500*$dpi/96)) "Expanded height at synthetic DPI $dpi"
+    Assert-Native (($bounds.Bottom-$bounds.Top) -eq (460*$dpi/96)) "Expanded height without unused quota rows at synthetic DPI $dpi"
     Save-OverlayScreenshot $app.Window (Join-Path $profile "expanded-$dpi.png")
+    $toggle=Get-ToggleBounds 'Collapse'
     Invoke-NativeButton 'Collapse'
     [void][OverlayNativeTest]::GetWindowRect($app.Window,[ref]$bounds)
     Assert-Native (($bounds.Right-$bounds.Left) -eq (340*$dpi/96)) "Collapsed width at synthetic DPI $dpi"
+    $collapsedToggle=Get-ToggleBounds 'Expand overlay'
+    Assert-Native ($toggle -eq $collapsedToggle) "Toggle stays at same screen bounds when collapsed at DPI $dpi"
     Save-OverlayScreenshot $app.Window (Join-Path $profile "collapsed-$dpi.png")
     Invoke-NativeButton 'Expand overlay'
+    Assert-Native ($toggle -eq (Get-ToggleBounds 'Collapse')) "Toggle stays at same screen bounds when expanded at DPI $dpi"
   }
   [OverlayNativeTest]::Dpi($app.Window,96)
   Start-Sleep -Milliseconds 200

@@ -207,9 +207,12 @@ struct App {
         }
         wake.notify_all();
     }
+    int expanded_height() const {
+        return 460 + 20 * std::min(2, int(view["additionalLimits"].size()));
+    }
     void size_window() {
         const int width = static_cast<int>((expanded ? 380 : 340) * scale),
-                  height = static_cast<int>((expanded ? 500 : 88) * scale);
+                  height = static_cast<int>((expanded ? expanded_height() : 88) * scale);
         RECT current{};
         GetWindowRect(hwnd, &current);
         MONITORINFO monitor{sizeof(monitor)};
@@ -252,9 +255,9 @@ struct App {
             ShowWindow(button, visible ? SW_SHOW : SW_HIDE);
             if (!visible)
                 continue;
-            float x = expanded ? (id == refresh_id ? 270.f : id == collapse_id ? 305.f : 340.f) : 300.f;
-            SetWindowPos(button, nullptr, int(x * scale), int((expanded ? 18 : 28) * scale), int(28 * scale),
-                         int(28 * scale), SWP_NOZORDER | SWP_NOACTIVATE);
+            float x = expanded ? (id == refresh_id ? 265.f : id == collapse_id ? 300.f : 340.f) : 300.f;
+            SetWindowPos(button, nullptr, int(x * scale), int(28 * scale), int(28 * scale), int(28 * scale),
+                         SWP_NOZORDER | SWP_NOACTIVATE);
         }
     }
     void update() {
@@ -264,7 +267,10 @@ struct App {
             copy = snapshot(state, connection, error, now());
         }
         const bool graph_changed = view.is_null() || view["reset"] != copy["reset"];
+        const int old_height = expanded_height();
         view = std::move(copy);
+        if (expanded && old_height != expanded_height())
+            size_window();
         const auto tip = wide("Codex usage: " + percent(view["reset"]["usedPercent"]) +
                               (view["stale"].get<bool>() ? " (last synced)" : ""));
         wcsncpy_s(tray.szTip, tip.c_str(), _TRUNCATE);
@@ -321,7 +327,7 @@ struct App {
         }
     }
     void text(const std::string &value, float x, float y, float width, float height, int size,
-              unsigned color = 0xe9edf7, bool bold = false) {
+              unsigned color = 0xe9edf7, bool bold = false, bool centered = false) {
         const int key = size * 2 + int(bold);
         if (!fonts.contains(key)) {
             ComPtr<IDWriteTextFormat> format;
@@ -333,6 +339,9 @@ struct App {
             fonts.emplace(key, std::move(format));
         }
         brush->SetColor(D2D1::ColorF(color));
+        fonts[key]->SetTextAlignment(centered ? DWRITE_TEXT_ALIGNMENT_CENTER : DWRITE_TEXT_ALIGNMENT_LEADING);
+        fonts[key]->SetParagraphAlignment(centered ? DWRITE_PARAGRAPH_ALIGNMENT_CENTER
+                                                   : DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
         const auto label = wide(value);
         target->DrawText(label.c_str(), static_cast<UINT32>(label.size()), fonts[key].Get(),
                          D2D1::RectF(x, y, x + width, y + height), brush.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
@@ -451,7 +460,7 @@ struct App {
                             brush.Get(), 5);
                     }
                 }
-                text(percent(used), 24, 33, 47, 24, 15, 0xe9edf7, true);
+                text(percent(used), 18, 17, 54, 54, 15, 0xe9edf7, true, true);
                 text(view["stale"].get<bool>() ? "CODEX LIMIT  /  LAST SYNCED" : "CODEX LIMIT", 86, 13, 209,
                      18, 10, 0x9aa7bf);
                 text(reset_time ? "Reset in " + count : count, 86, 31, 209, 25, 17, 0xe9edf7, true);
@@ -510,7 +519,7 @@ struct App {
                                                                : "Updates every minute";
                 if (view["connectionMessage"].is_string())
                     status = view["connectionMessage"].get<std::string>();
-                text(status, 20, 479, 340, 17, 9, 0x9aa7bf);
+                text(status, 20, float(expanded_height() - 21), 340, 17, 9, 0x9aa7bf);
             }
             const auto result = target->EndDraw();
             if (result == D2DERR_RECREATE_TARGET) {
@@ -884,8 +893,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         RegisterClassExW(&klass);
         POINT location{CW_USEDEFAULT, CW_USEDEFAULT};
         if (number(app.state["window"]["x"]) && number(app.state["window"]["y"])) {
-            location = restore_position(app.state["window"],
-                                        {app.expanded ? 380L : 340L, app.expanded ? 500L : 88L});
+            location =
+                restore_position(app.state["window"], {app.expanded ? 380L : 340L,
+                                                       app.expanded ? LONG(app.expanded_height()) : 88L});
         } else {
             RECT work{};
             SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
@@ -894,7 +904,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         HWND window =
             CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_CONTROLPARENT, window_class, app.title.c_str(),
                             WS_POPUP | WS_CLIPCHILDREN, location.x, location.y, app.expanded ? 380 : 340,
-                            app.expanded ? 500 : 88, nullptr, nullptr, instance, &app);
+                            app.expanded ? app.expanded_height() : 88, nullptr, nullptr, instance, &app);
         if (!window)
             throw std::runtime_error("Unable to create overlay window");
         app.login(app.state["settings"]["startAtLogin"]);
