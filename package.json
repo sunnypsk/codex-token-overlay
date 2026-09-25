@@ -8,6 +8,9 @@
   "author": "Local",
   "license": "MIT",
   "scripts": {
+    "build:native": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-native.ps1 -Test",
+    "test:native:ui": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-native-ui.ps1",
+    "dist:native": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-native.ps1",
     "dev": "electron-vite dev",
     "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
     "test": "vitest run",
