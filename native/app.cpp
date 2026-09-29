@@ -373,23 +373,12 @@ struct App {
             return;
         chart_start = *start;
         chart_reset = *end;
-        chart_ceiling = 100;
-        Json points = Json::array();
-        for (const auto &p : reset["observations"]) {
-            const auto at = timestamp(p["at"]);
-            if (at && *at >= *start && *at < *end) {
-                points.push_back(p);
-                chart_ceiling = std::max(chart_ceiling, p["usedPercent"].get<double>());
-                if (p.contains("projectedUsedPercent") && number(p["projectedUsedPercent"]))
-                    chart_ceiling = std::max(chart_ceiling, p["projectedUsedPercent"].get<double>());
-            }
-        }
-        const auto projected = reset["projection"]["projectedUsedPercent"];
-        if (number(projected))
-            chart_ceiling = std::max(chart_ceiling, projected.get<double>());
-        chart_ceiling = std::ceil(chart_ceiling / 25) * 25;
+        const auto display = trend_display(view);
+        const auto &points = display.points;
+        const auto &projected = display.projected;
+        chart_ceiling = display.ceiling;
         for (bool forecast : {false, true})
-            for (const auto &group : segments(points, forecast)) {
+            for (const auto &group : segments(forecast ? display.forecasts : points, forecast)) {
                 ComPtr<ID2D1PathGeometry> geometry;
                 factory->CreatePathGeometry(geometry.GetAddressOf());
                 ComPtr<ID2D1GeometrySink> sink;
@@ -441,8 +430,12 @@ struct App {
             const auto reset_time = timestamp(reset["resetsAt"]);
             const auto used = reset["usedPercent"];
             const auto projected = reset["projection"]["projectedUsedPercent"];
+            const auto start_time = timestamp(reset["startsAt"]);
+            const bool early = start_time && reset_time &&
+                               early_forecast(*start_time, *reset_time, forecast_time(view));
             const auto projection_text = number(projected)
-                                             ? "Projected " + percent(projected, true) + " by reset"
+                                             ? std::string(early ? "Early estimate " : "Projected ") +
+                                                   percent(projected, true) + " by reset"
                                              : "Projection unavailable";
             const auto count = reset_time ? countdown(*reset_time, now()) : "Reset unavailable";
             if (!expanded) {
@@ -562,7 +555,8 @@ struct App {
         std::string message = hkt(*timestamp(point["at"]));
         if (point.contains("usedPercent"))
             message += "\nObserved " + percent(point["usedPercent"], true);
-        message += "\nProjected at reset " + (point.contains("projectedUsedPercent")
+        const bool early = early_forecast(chart_start, chart_reset, *timestamp(point["at"]));
+        message += std::string(early ? "\nEarly estimate at reset " : "\nProjected at reset ") + (point.contains("projectedUsedPercent")
                                                   ? (point["projectedUsedPercent"].is_null()
                                                          ? "Unavailable"
                                                          : percent(point["projectedUsedPercent"], true))

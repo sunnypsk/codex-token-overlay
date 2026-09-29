@@ -24,6 +24,8 @@ This is an independent project, not an official OpenAI product. A working, signe
 
 Quota data refreshes every minute and on App Server notifications. The forecast extrapolates the current reset window's average consumption pace; it is an estimate, not a guarantee of future usage. Unknown or expired values show N/A. Offline or stale data retains recorded history but hides the current forecast extension.
 
+During the first six hours of a reset window longer than six hours, the native overlay labels the card forecast **Early estimate**. These early forecasts remain stored and available in observed-point tooltips, but are excluded from the forecast curve, reset endpoint and chart scale. Observed usage remains visible throughout. Forecast plotting starts with the first valid reading at or after six hours; shorter windows retain their existing behavior. This is a display filter, not smoothing or a change to the forecast calculation.
+
 ## Build the native version
 
 Use Windows x64 with:

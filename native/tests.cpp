@@ -138,6 +138,59 @@ int main(int argc, char **argv) {
                 "removed monitor falls back to available DIP layout");
         require(projection(25, at - 3600000, at + 3600000, at)["projectedUsedPercent"] == 50, "projection");
         require(projection(nullptr, at - 1, at + 1, at)["status"] == "unavailable", "missing is not zero");
+        const Millis hour = 3600000, week = 168 * hour;
+        require(early_forecast(at, at + week, at + 6 * hour - 1), "early until six hours");
+        require(!early_forecast(at, at + week, at + 6 * hour), "six hour boundary included");
+        require(!early_forecast(at, at + week, at + 6 * hour + 1), "after boundary included");
+        require(!early_forecast(at, at + 6 * hour, at + hour), "six hour windows unchanged");
+        require(!early_forecast(at, at + hour, at + 60000), "short windows unchanged");
+        auto weekly = defaults();
+        weekly["rateLimits"] = parse_limits({{"rateLimits", {{"limitId", "codex"},
+            {"primary", {{"usedPercent", 2}, {"windowDurationMins", 10080},
+                         {"resetsAt", (at + week) / 1000}}}}}});
+        const Millis spike_at = at + 2863766;
+        weekly["rateLimitsSyncedAt"] = iso(spike_at);
+        observe(weekly, spike_at);
+        auto early_view = snapshot(weekly, "online", "", spike_at);
+        auto early_display = trend_display(early_view);
+        require(early_view["reset"]["projection"]["projectedUsedPercent"] == 422.4,
+                "raw early card forecast unchanged");
+        require(early_display.ceiling == 100 && early_display.projected.is_null() &&
+                    segments(early_display.forecasts, true).empty() && early_display.points.size() == 1,
+                "early spike keeps observed point without forecast or endpoint or inflated axis");
+        require(early_display.points[0]["projectedUsedPercent"] == 422.4,
+                "raw early forecast available to tooltip");
+        require(trend_display(snapshot(normalize_state(weekly), "online", "", spike_at)).ceiling == 100,
+                "loaded historical spike is filtered without restart warmup");
+        const auto saved_weekly = weekly;
+        trend_display(early_view);
+        require(weekly == saved_weekly, "presentation leaves stored history unchanged");
+        weekly["rateLimitsSyncedAt"] = iso(at + 6 * hour);
+        observe(weekly, at + 6 * hour);
+        auto mature_view = snapshot(weekly, "online", "", at + 6 * hour);
+        auto mature_display = trend_display(mature_view);
+        require(mature_display.projected == 56 && segments(mature_display.forecasts, true).size() == 1 &&
+                    mature_display.points.size() == 2, "forecast begins on first six hour reading");
+        mature_view["reset"]["observations"].push_back(
+            {{"at", iso(at + 7 * hour)}, {"usedPercent", 5}, {"projectedUsedPercent", 118.5}});
+        mature_view["reset"]["projection"]["projectedUsedPercent"] = 117.4;
+        require(trend_display(mature_view).ceiling == 125, "historical early peak no longer expands mature axis");
+        require(segments(trend_display(mature_view).forecasts, true).size() == 2, "forecast gaps preserved");
+        auto offline_display = trend_display(snapshot(weekly, "offline", "", at + 6 * hour));
+        require(offline_display.projected.is_null() && !segments(offline_display.forecasts, true).empty(),
+                "offline retains eligible history without endpoint");
+        early_view["generatedAt"] = iso(at + 6 * hour);
+        require(trend_display(early_view).projected.is_null(), "old early reading cannot unlock endpoint by wall clock");
+        mature_view["reset"]["observations"][1].erase("projectedUsedPercent");
+        require(segments(trend_display(mature_view).forecasts, true).size() == 1,
+                "legacy missing forecast is not invented");
+        weekly["rateLimits"][0]["primary"]["resetsAt"] = (at + 2 * week) / 1000;
+        weekly["rateLimits"][0]["primary"]["usedPercent"] = 0;
+        weekly["rateLimitsSyncedAt"] = iso(at + week + hour);
+        observe(weekly, at + week + hour);
+        auto next_display = trend_display(snapshot(weekly, "online", "", at + week + hour));
+        require(next_display.points.size() == 1 && next_display.points[0]["usedPercent"] == 0 &&
+                    next_display.projected.is_null(), "new cycle filters forecasts and preserves actual zero");
         auto state = defaults();
         state["rateLimits"] = parse_limits(
             {{"rateLimits",

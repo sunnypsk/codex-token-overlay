@@ -21,6 +21,14 @@ Json normalize_state(const Json &input);
 void observe(Json &state, Millis at);
 Json snapshot(const Json &state, const std::string &connection, const std::string &error, Millis at);
 std::vector<std::vector<Json>> segments(const Json &points, bool forecasts);
+// Presentation only: persisted forecasts and quota contracts remain unchanged.
+bool early_forecast(Millis start, Millis reset, Millis at);
+Millis forecast_time(const Json &view);
+struct TrendDisplay {
+    Json points = Json::array(), forecasts = Json::array(), projected = nullptr;
+    double ceiling = 100;
+};
+TrendDisplay trend_display(const Json &view);
 std::string percent(const Json &value, bool decimal = false);
 std::string countdown(Millis reset, Millis at);
 std::string hkt(Millis at);

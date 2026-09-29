@@ -295,6 +295,44 @@ std::vector<std::vector<Json>> segments(const Json &points, bool forecasts) {
         result.push_back(std::move(group));
     return result;
 }
+bool early_forecast(Millis start, Millis reset, Millis at) {
+    constexpr Millis six_hours = 6 * 60 * 60 * 1000;
+    return reset - start > six_hours && at >= start && at - start < six_hours;
+}
+Millis forecast_time(const Json &view) {
+    const auto &points = view["reset"]["observations"];
+    if (!points.empty())
+        if (const auto at = timestamp(points.back()["at"]))
+            return *at;
+    return timestamp(view["rateLimitsSyncedAt"]).value_or(timestamp(view["generatedAt"]).value_or(0));
+}
+TrendDisplay trend_display(const Json &view) {
+    TrendDisplay display;
+    const auto &reset = view["reset"];
+    const auto start = timestamp(reset["startsAt"]), end = timestamp(reset["resetsAt"]);
+    if (!start || !end || *end <= *start)
+        return display;
+    for (const auto &point : reset["observations"]) {
+        const auto at = timestamp(point["at"]);
+        if (!at || *at < *start || *at >= *end)
+            continue;
+        display.points.push_back(point);
+        display.ceiling = std::max(display.ceiling, point["usedPercent"].get<double>());
+        auto forecast = point;
+        if (early_forecast(*start, *end, *at))
+            forecast["projectedUsedPercent"] = nullptr;
+        if (forecast.contains("projectedUsedPercent") && number(forecast["projectedUsedPercent"]))
+            display.ceiling = std::max(display.ceiling, forecast["projectedUsedPercent"].get<double>());
+        display.forecasts.push_back(std::move(forecast));
+    }
+    if (!early_forecast(*start, *end, forecast_time(view))) {
+        display.projected = reset["projection"]["projectedUsedPercent"];
+        if (number(display.projected))
+            display.ceiling = std::max(display.ceiling, display.projected.get<double>());
+    }
+    display.ceiling = std::ceil(display.ceiling / 25) * 25;
+    return display;
+}
 std::string percent(const Json &v, bool decimal) {
     if (!number(v))
         return "N/A";
