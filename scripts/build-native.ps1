@@ -10,6 +10,9 @@ $build = Join-Path $repo 'build\native'
 if ($LASTEXITCODE) { throw 'Native configure failed' }
 & $cmake --build $build --config Release --parallel
 if ($LASTEXITCODE) { throw 'Native build failed' }
+foreach ($helper in @('claude-statusline.ps1','setup-claude-statusline.ps1')) {
+  Copy-Item -LiteralPath (Join-Path $PSScriptRoot $helper) -Destination (Join-Path $build 'Release')
+}
 if ($Test) {
   & (Join-Path $installation 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\ctest.exe') --test-dir $build -C Release --output-on-failure
   if ($LASTEXITCODE) { throw 'Native tests failed' }

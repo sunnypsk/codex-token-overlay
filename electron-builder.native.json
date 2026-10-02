@@ -1,12 +1,12 @@
 {
   "appId": "com.local.codextokenoverlay",
   "productName": "Codex Token Overlay",
-  "extraMetadata": { "version": "0.2.0" },
+  "extraMetadata": { "version": "0.2.1" },
   "directories": { "output": "release/native" },
   "win": {
     "icon": "build/icon.ico",
     "target": [{ "target": "nsis", "arch": ["x64"] }],
-    "artifactName": "Codex-Token-Overlay-0.2.0-Setup.${ext}"
+    "artifactName": "Codex-Token-Overlay-0.2.1-Setup.${ext}"
   },
   "nsis": {
     "packElevateHelper": false,

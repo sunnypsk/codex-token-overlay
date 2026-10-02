@@ -1,5 +1,44 @@
 # Native validation record
 
+## v0.2.1: Claude Code integration, 2026-10-02
+
+Local, uncommitted implementation based on `26766babc44d06094b3e502624aed9941bc75237`. Installation/upgrade, commit and push were not performed. Generated binaries, account caches, fake settings, screenshots and raw measurements remain outside the published source tree.
+
+- Packaged EXE SHA256: `DC105C23646FFB65AB267F8E69C176AA9675B30A9065FF5D29C542E11D0EED03`; byte-identical to the tested Release build, product version 0.2.1.
+- Installer SHA256: `B675E2A5A11084E76836DD751D38E4F233D801CBCF7AEDF456F43C4F5A058EAF`; unsigned. Both bundled PowerShell helpers match their source hashes.
+- Native core: 106 assertions passed. TypeScript suite with the native parity executable: 169 tests in 22 files passed. Existing typechecks passed; their TypeScript inputs did not change.
+- Claude cases cover 0%, 100%, missing/malformed input, reset expiry, stale readings, out-of-order samples and a cache replacement retaining the previous file timestamp. Eight concurrent bridge processes preserved one valid account reading without summing percentages or touching Codex quota state.
+- Fake-config checks cover byte-preserving idempotence, paths containing spaces, moving the managed executable, preserving hooks and subsequent unrelated edits, and refusing to replace or undo a user-changed status line. Real connection preserved existing hooks and kept a byte-for-byte settings backup.
+- A real Claude Code 2.1.287 status-line payload matched the user's `/usage` percentage. The official integer-second reset differed from Claude's more precise cached timestamp by less than one second, crossing a displayed minute boundary. An isolated copy of a subsequent real payload naturally passed five minutes without further input and retained its percentage and reset countdown with `Last synced`; the actual Claude session was left available for normal use.
+- With an invalid Codex executable, Claude updated independently while the main overlay lock was held. Synthetic 96/144/192 DPI checks verified 340 x 124 DIP compact dimensions, fixed toggle bounds, expanded dimensions, freshness and automatic expiry. Existing graph tooltips, keyboard, pinning, tray, dragging and 100 hide/show checks passed.
+- One integration run completed all assertions but exceeded its ten-second shutdown deadline; that process subsequently exited. An identical rerun and the real-payload check exited within the deadline. No owned test overlay or App Server remained after final verification.
+- Independent verifier confirmed the frozen changed/untracked file hashes and reran native/parity checks. A reviewer found no graph contract drift in warm-up filtering, chart scale, missing forecasts, gap segmentation, reset endpoint or indexed tooltip marks.
+
+### Resource remeasurement
+
+The packaged EXE ran against an isolated copy of approximately 7,400 existing Codex observations, one real Codex App Server and its conhost. Claude's four-field cache was connected. Each mode had 120 seconds of warmup, then 120 seconds of sampling at five-second intervals. CPU is normalized across logical processors. No working-set trimming or observation removal was used.
+
+| State | Samples | Peak combined Private Working Set (MiB) | Mean CPU | GDI start/end | USER start/end |
+|---|---:|---:|---:|---:|---:|
+| Collapsed | 25 | 35.266 | 0.01361% | 11 / 11 | 15 / 15 |
+| Expanded | 24 | 42.535 | 0.01488% | 11 / 11 | 14 / 14 |
+| Hidden | 24 | 42.559 | 0.00810% | 11 / 11 | 13 / 14 |
+
+All 73 samples met the <=50 MiB stable-state budget and <=0.1% mean CPU budget. The collapsed boundary sample at 120.52 seconds was included. Codex sync remained fresh at every phase end; the harness exited successfully and confirmed cleanup of its App Server tree.
+
+An initial expanded diagnostic reached 57.332 MiB. Streaming graph geometry from existing observations and retaining only indexes for hover marks removed redundant JSON copies while keeping all observations and recorded forecasts. A later 30-second-warmup diagnostic caught a 69.609 MiB combined spike driven by App Server startup, then settled below 36 MiB. That failed diagnostic was retained, and the final run used the established two-minute warmup. This does not prove that startup or every future App Server operation stays below 50 MiB.
+
+Reproduce the shortened run after building and packaging:
+
+```powershell
+$exe = (Resolve-Path 'release/native/win-unpacked/Codex Token Overlay.exe').Path
+& './scripts/measure-native.ps1' -Executable $exe -ClaudeUsage -SampleSeconds 120 -WarmupSeconds 120 -RunLabel 'claude-v021-packaged'
+```
+
+This is a shortened remeasurement (`AcceptanceRun: false` in the harness), not the default ten-minute-per-mode benchmark or a long soak. Physical mixed-DPI dragging and an actual installer upgrade/rollback remain unverified. The older measurements below apply only to their identified revisions and binaries.
+
+## Earlier native validation, 2026-09-25
+
 Recorded on 2026-09-25 on a Windows x64 workstation. This summary intentionally excludes local account state, machine-specific paths and raw diagnostic captures.
 
 ## Tested revisions

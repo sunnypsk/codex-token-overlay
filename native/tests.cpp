@@ -95,6 +95,46 @@ int main(int argc, char **argv) {
         require(percent(1234.56, true) == "1,234.6%", "forecast formatting");
         require(timestamp("2026-09-25T08:00:00+08:00") == at, "timezone offset");
         require(!timestamp("2026-02-30T00:00:00Z"), "reject invalid dates");
+        const auto claude_input = [&](Json used, Json reset) {
+            return Json{{"rate_limits", {{"five_hour", {{"used_percentage", used}, {"resets_at", reset}}}}}};
+        };
+        auto claude = claude_sample(claude_input(0, at / 1000 + 18000), at);
+        require(claude["usedPercent"] == 0, "Claude real zero preserved");
+        require(claude_snapshot(claude, at)["usedPercent"] == 0, "Claude zero displayed");
+        require(claude_sample(claude_input(100, at / 1000 + 18000), at)["usedPercent"] == 100, "Claude full quota");
+        require(claude_sample(claude_input(12.5, nullptr), at)["resetsAt"].is_null(), "Claude unknown reset preserved");
+        for (const auto &bad : {Json(), Json::object(), claude_input(nullptr, nullptr),
+                               claude_input("5", nullptr), claude_input(-1, nullptr), claude_input(101, nullptr),
+                               claude_input(1, "later"), claude_input(1, at / 1000)})
+            require(claude_sample(bad, at).is_null(), "Claude invalid or absent sample rejected");
+        require(!claude_snapshot(nullptr, at)["enabled"].get<bool>(), "Claude disconnected default");
+        require(!claude_snapshot(claude, at + 300000)["stale"].get<bool>(), "Claude five-minute fresh boundary");
+        require(claude_snapshot(claude, at + 300001)["stale"].get<bool>(), "Claude last synced boundary");
+        require(claude_snapshot(claude, at + 18000000)["usedPercent"].is_null(), "Claude expired usage not zero");
+        require(claude_snapshot(claude, at + 18000000)["expired"].get<bool>(), "Claude reset deadline");
+        const auto claude_folder = fs::temp_directory_path() / (L"overlay-claude-core-" + std::to_wstring(GetCurrentProcessId()));
+        fs::create_directories(claude_folder);
+        const auto claude_file = claude_folder / L"claude-usage.json";
+        require(write_claude_sample(claude_folder, claude), "Claude initial atomic write");
+        const auto initial_bytes = read_file(claude_file);
+        require(!write_claude_sample(claude_folder, nullptr) && read_file(claude_file) == initial_bytes,
+                "Claude invalid sample preserves bytes");
+        auto newer_claude = claude_sample(claude_input(42, at / 1000 + 18000), at + 1000);
+        require(write_claude_sample(claude_folder, newer_claude) && !write_claude_sample(claude_folder, claude),
+                "Claude out-of-order writers keep latest received sample");
+        ClaudeReader claude_reader(claude_folder);
+        require(claude_reader.read()["usedPercent"] == 42, "Claude reader receives latest percentage");
+        const auto previous_modified = fs::last_write_time(claude_file);
+        { std::ofstream out(claude_file); out << "{invalid"; }
+        require(claude_reader.read()["usedPercent"] == 42, "Claude malformed replacement retains last reading");
+        auto next_claude = claude_sample(claude_input(2, at / 1000 + 36000), at + 2000);
+        require(write_claude_sample(claude_folder, next_claude), "Claude new window writes latest sample");
+        fs::last_write_time(claude_file, previous_modified);
+        require(claude_reader.read()["usedPercent"] == 2,
+                "Claude replacement with the same file timestamp is still detected");
+        fs::remove(claude_file);
+        require(claude_reader.read().is_null(), "Claude disconnect removes row");
+        fs::remove(claude_folder);
         std::vector<MonitorSpace> monitors{
             {{0, 0, 1920, 1080}, 1.5}, {{1920, 0, 4480, 1440}, 2}, {{-1920, 0, 0, 1080}, 1}};
         layout_monitors(monitors);

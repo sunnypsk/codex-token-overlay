@@ -1,6 +1,6 @@
 # Codex Token Overlay
 
-A lightweight Windows overlay for Codex quota percentages, reset countdowns and usage forecasts. The current **v0.2.0 native version** uses C++20, Win32, Direct2D and DirectWrite. It does not ship Electron, Node.js or WebView. The earlier Electron v0.1.15 source remains available for comparison and rollback.
+A lightweight Windows overlay for Codex quota percentages, reset countdowns and usage forecasts, with optional Claude Code 5-hour usage. The current **v0.2.1 native version** uses C++20, Win32, Direct2D and DirectWrite. It does not ship Electron, Node.js or WebView. The earlier Electron v0.1.15 source remains available for comparison and rollback.
 
 This is an independent project, not an official OpenAI product. A working, signed-in Codex installation with `codex app-server` support is required; the overlay does not include Codex or provide an account.
 
@@ -20,7 +20,8 @@ This is an independent project, not an official OpenAI product. A working, signe
 - Additional quota buckets, chart tooltips, manual refresh and automatic reconnect.
 - Always-on-top mode, dragging, system tray, hide/restore and optional Start with Windows.
 - Per-monitor DPI support; centered ring percentage and a shared expand/collapse button position.
-- Compact 340 x 88 DIP view. Expanded view is 380 DIP wide and 460/480/500 DIP tall, depending on additional quota rows.
+- Optional Claude Code 5-hour quota, reset countdown and last-received status through the official status line.
+- Compact 340 x 88 DIP view, or 340 x 124 DIP with Claude connected. Expanded view is 380 DIP wide and 460/480/500 DIP tall, depending on additional quota rows.
 
 Quota data refreshes every minute and on App Server notifications. The forecast extrapolates the current reset window's average consumption pace; it is an estimate, not a guarantee of future usage. Unknown or expired values show N/A. Offline or stale data retains recorded history but hides the current forecast extension.
 
@@ -62,15 +63,21 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-native.ps1
 Outputs:
 
 - `release/native/win-unpacked/Codex Token Overlay.exe`
-- `release/native/Codex-Token-Overlay-0.2.0-Setup.exe`
+- `release/native/Codex-Token-Overlay-0.2.1-Setup.exe`
 
 Packaging does not install or launch an upgrade. The NSIS installer is per-user and unsigned. Close the old overlay, then run the installer to update it. Generated installers are excluded from Git; build locally unless a binary has been explicitly published as a GitHub release asset.
 
 The product/App ID and startup entry remain `com.local.codextokenoverlay`. The native executable and Electron version share an exclusive profile lock to prevent simultaneous writes. Unrelated Codex processes are not terminated.
 
+## Connect Claude Code
+
+Claude Code v2.1.251 or newer can supply its subscription's 5-hour quota through the [official status line](https://code.claude.com/docs/en/statusline#rate-limit-usage). The bundled `setup-claude-statusline.ps1` connects it using your selected overlay executable. It backs up Claude settings, preserves hooks and other fields, and refuses to replace an unrelated status line. See [setup and rollback instructions](docs/CLAUDE.md).
+
+Claude usage appears after the first API response. Updates follow Claude Code status-line events. After five minutes without a reading, the overlay marks it **Last synced**; the reset countdown continues. When that window ends, usage shows **N/A** until a new reading arrives. The overlay receives the account's 5-hour quota; it does not calculate a per-conversation token percentage or add concurrent sessions together.
+
 ## Data, privacy and rollback
 
-The active runtime reads `account/rateLimits/read` from one local Codex App Server over JSON-RPC. It does not scan conversation/session files, request account token usage, or refresh pricing. Legacy session/pricing code remains in the Electron source for compatibility and tests.
+The active runtime reads `account/rateLimits/read` from one local Codex App Server over JSON-RPC. Claude integration reads only its separate local usage cache, written by `--claude-statusline` from Claude Code's official stdin payload. The bridge does not read Claude credentials or contact Anthropic APIs, and stores no prompts or transcripts. It does not scan conversation/session files, request account token usage, or refresh pricing. Legacy session/pricing code remains in the Electron source for compatibility and tests.
 
 Settings, position, quota snapshots and history live in `%APPDATA%\codex-token-overlay\quota-state.json` (schema v1). The overlay uses Codex's existing authentication through App Server; it does not ask you to paste credentials into the overlay. App Server retains its own Codex authentication and network behavior.
 
@@ -86,9 +93,9 @@ Do not commit local credentials, `.env` files, quota state, logs or diagnostic c
 
 ## Validation and resource measurements
 
-The measured pre-layout-fix native build used **26.89 MiB / 33.02 MiB / 31.58 MiB peak combined Private Working Set** in collapsed / expanded / hidden states, including its real App Server and conhost. Each state was sampled for ten minutes after two minutes of warmup. Mean machine CPU was below 0.01%. These are measurements on one Windows x64 machine, not a guarantee for every system or Codex version.
+The packaged v0.2.1 native build, with Claude connected and about 7,400 Codex observations, used **35.27 MiB / 42.54 MiB / 42.56 MiB peak combined Private Working Set** in collapsed / expanded / hidden states, including its real App Server and conhost. Each state was sampled for two minutes after two minutes of warmup. All 73 samples were <=50 MiB, and mean machine CPU was below 0.02%. A separate short-warmup diagnostic caught a 69.61 MiB App Server startup spike before it settled; the stable measurements do not establish a startup memory cap.
 
-The later layout fix passed core tests and UI checks at synthetic 100%, 150% and 200% DPI. The full resource run was not repeated for that layout-only revision. See [validation details and limits](docs/VALIDATION.md).
+Native assertions, TypeScript parity, setup/undo, Codex-offline Claude updates and UI checks at synthetic 100%, 150% and 200% DPI passed. Real Claude output matched `/usage`, and an isolated copy retained its percentage, countdown and `Last synced` after five minutes. The default ten-minute-per-state benchmark and a long soak were not repeated for v0.2.1. See [validation details and limits](docs/VALIDATION.md), including the older, longer measurements. These are local results, not a guarantee for every system or Codex version.
 
 Core, TypeScript parity and UI checks:
 
@@ -98,6 +105,7 @@ $env:NATIVE_TEST_EXE = (Resolve-Path 'build/native/Release/overlay_tests.exe').P
 pnpm test
 pnpm typecheck
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-native-ui.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-native-claude.ps1
 ```
 
 UI and measurement scripts create isolated profiles from an existing local overlay state. Run the overlay at least once first, and keep the desktop unlocked during visible tests. They do not change the real startup entry. Isolated operation requires both `CODEX_OVERLAY_E2E=1` and `CODEX_OVERLAY_E2E_USER_DATA`; the scripts set these automatically.
@@ -112,7 +120,7 @@ Performance mode measures all owned processes every five seconds and requires ev
 
 ## Retained Electron implementation
 
-`package.json` stays at **0.1.15** for the Electron fallback; native CMake/resources and `electron-builder.native.json` define **0.2.0**. The two build paths are intentional.
+`package.json` stays at **0.1.15** for the Electron fallback; native CMake/resources and `electron-builder.native.json` define **0.2.1**. The two build paths are intentional.
 
 ```powershell
 pnpm install --frozen-lockfile

@@ -32,4 +32,7 @@ TrendDisplay trend_display(const Json &view);
 std::string percent(const Json &value, bool decimal = false);
 std::string countdown(Millis reset, Millis at);
 std::string hkt(Millis at);
+Json claude_sample(const Json &input, Millis received_at);
+Json claude_snapshot(const Json &sample, Millis at);
+std::string claude_line(const Json &view, Millis at);
 } // namespace overlay
