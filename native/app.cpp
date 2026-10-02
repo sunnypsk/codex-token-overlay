@@ -33,16 +33,12 @@ struct App {
     POINT last_mouse{-1, -1};
     Store store;
     Json state, view;
-    ClaudeReader claude_reader;
-    Json claude_cache, claude_view;
     std::string connection = "connecting", error;
     std::mutex mutex;
     std::condition_variable wake;
     std::atomic_bool stopped{false};
     bool dirty = false, refresh_requested = false;
     std::thread worker;
-    std::thread claude_worker;
-    std::condition_variable claude_wake;
     ComPtr<ID2D1Factory> factory;
     ComPtr<IDWriteFactory> text_factory;
     ComPtr<ID2D1HwndRenderTarget> target;
@@ -56,32 +52,26 @@ struct App {
     std::vector<Line> lines;
     struct Mark {
         float x, y;
-        size_t observation;
-        bool forecast, endpoint = false;
+        Json point;
+        bool forecast;
     };
     std::vector<Mark> marks;
-    Json endpoint;
     double chart_ceiling = 100;
     Millis chart_start = 0, chart_reset = 0;
     App(fs::path path, bool isolated)
         : profile(std::move(path)), test(isolated),
           fixture(isolated && environment(L"CODEX_OVERLAY_E2E_FIXTURE") == L"1"),
-          store(profile / L"quota-state.json"), claude_reader(profile) {
+          store(profile / L"quota-state.json") {
         state = store.load();
         expanded = state["settings"]["expanded"];
         view = snapshot(state, connection, error, now());
-        claude_cache = claude_reader.read();
-        claude_view = claude_snapshot(claude_cache, now());
         title = L"Codex Token Overlay | " + wide(sha256(utf8(fs::absolute(profile).wstring())).substr(0, 16));
     }
     ~App() {
         stopped = true;
         wake.notify_all();
-        claude_wake.notify_all();
         if (worker.joinable())
             worker.join();
-        if (claude_worker.joinable())
-            claude_worker.join();
         if (tray.hWnd)
             Shell_NotifyIconW(NIM_DELETE, &tray);
         if (icon)
@@ -92,23 +82,6 @@ struct App {
             PostMessageW(hwnd, model_message, 0, 0);
     }
     void run_service() {
-        claude_worker = std::thread([this] {
-            while (!stopped) {
-                const auto reading = claude_reader.read();
-                bool changed = false;
-                {
-                    std::lock_guard lock(mutex);
-                    if (claude_cache != reading) {
-                        claude_cache = reading;
-                        changed = true;
-                    }
-                }
-                if (changed)
-                    notify();
-                std::unique_lock lock(mutex);
-                claude_wake.wait_for(lock, std::chrono::seconds(1), [this] { return stopped.load(); });
-            }
-        });
         worker = std::thread([this] {
             Server server(stopped);
             ULONGLONG next = 0;
@@ -237,12 +210,9 @@ struct App {
     int expanded_height() const {
         return 460 + 20 * std::min(2, int(view["additionalLimits"].size()));
     }
-    int collapsed_height() const {
-        return claude_view["enabled"].get<bool>() ? 124 : 88;
-    }
     void size_window() {
         const int width = static_cast<int>((expanded ? 380 : 340) * scale),
-                  height = static_cast<int>((expanded ? expanded_height() : collapsed_height()) * scale);
+                  height = static_cast<int>((expanded ? expanded_height() : 88) * scale);
         RECT current{};
         GetWindowRect(hwnd, &current);
         MONITORINFO monitor{sizeof(monitor)};
@@ -291,21 +261,18 @@ struct App {
         }
     }
     void update() {
-        Json copy, claude_copy;
+        Json copy;
         {
             std::lock_guard lock(mutex);
             copy = snapshot(state, connection, error, now());
-            claude_copy = claude_snapshot(claude_cache, now());
         }
         const bool graph_changed = view.is_null() || view["reset"] != copy["reset"];
-        const int old_height = expanded ? expanded_height() : collapsed_height();
+        const int old_height = expanded_height();
         view = std::move(copy);
-        claude_view = std::move(claude_copy);
-        if (old_height != (expanded ? expanded_height() : collapsed_height()))
+        if (expanded && old_height != expanded_height())
             size_window();
         const auto tip = wide("Codex usage: " + percent(view["reset"]["usedPercent"]) +
-                              (view["stale"].get<bool>() ? " (last synced)" : "") +
-                              (claude_view["enabled"].get<bool>() ? " | " + claude_line(claude_view, now()) : ""));
+                              (view["stale"].get<bool>() ? " (last synced)" : ""));
         wcsncpy_s(tray.szTip, tip.c_str(), _TRUNCATE);
         if (tray.hWnd)
             Shell_NotifyIconW(NIM_MODIFY, &tray);
@@ -331,11 +298,6 @@ struct App {
         const auto synced = timestamp(view["rateLimitsSyncedAt"]);
         if (synced && *synced + 120001 > at)
             delay = std::min(delay, *synced + 120001 - at);
-        const auto claude_received = timestamp(claude_view["receivedAt"]);
-        if (claude_received && *claude_received + 300001 > at)
-            delay = std::min(delay, *claude_received + 300001 - at);
-        if (const auto claude_reset = timestamp(claude_view["resetsAt"]); claude_reset && *claude_reset > at)
-            delay = std::min(delay, (*claude_reset - at) % 60000 + 1);
         for (const auto &limit : view["additionalLimits"])
             if (number(limit["resetsAt"])) {
                 auto until = static_cast<Millis>(limit["resetsAt"].get<double>() * 1000) - at;
@@ -411,79 +373,50 @@ struct App {
             return;
         chart_start = *start;
         chart_reset = *end;
-        const auto &points = reset["observations"];
-        const Json projected = early_forecast(*start, *end, forecast_time(view))
-                                   ? Json() : reset["projection"]["projectedUsedPercent"];
-        chart_ceiling = 100;
-        size_t last = points.size();
-        for (size_t i = 0; i < points.size(); ++i) {
-            const auto &p = points[i];
-            const auto at = timestamp(p["at"]);
-            if (!at || *at < *start || *at >= *end)
-                continue;
-            last = i;
-            chart_ceiling = std::max(chart_ceiling, p["usedPercent"].get<double>());
-            if (!early_forecast(*start, *end, *at) && p.contains("projectedUsedPercent") &&
-                number(p["projectedUsedPercent"]))
-                chart_ceiling = std::max(chart_ceiling, p["projectedUsedPercent"].get<double>());
-        }
-        if (number(projected))
-            chart_ceiling = std::max(chart_ceiling, projected.get<double>());
-        chart_ceiling = std::ceil(chart_ceiling / 25) * 25;
-        // Keep every observation in view; graph marks only need its index for hover.
-        for (bool forecast : {false, true}) {
-            ComPtr<ID2D1PathGeometry> geometry;
-            ComPtr<ID2D1GeometrySink> sink;
-            Millis previous = 0;
-            auto finish = [&] {
-                if (!sink)
-                    return;
+        const auto display = trend_display(view);
+        const auto &points = display.points;
+        const auto &projected = display.projected;
+        chart_ceiling = display.ceiling;
+        for (bool forecast : {false, true})
+            for (const auto &group : segments(forecast ? display.forecasts : points, forecast)) {
+                ComPtr<ID2D1PathGeometry> geometry;
+                factory->CreatePathGeometry(geometry.GetAddressOf());
+                ComPtr<ID2D1GeometrySink> sink;
+                geometry->Open(sink.GetAddressOf());
+                bool first = true;
+                for (const auto &p : group) {
+                    const auto used = p[forecast ? "projectedUsedPercent" : "usedPercent"].get<double>();
+                    const auto position = D2D1::Point2F(px(p), py(used));
+                    if (first) {
+                        sink->BeginFigure(position, D2D1_FIGURE_BEGIN_HOLLOW);
+                        first = false;
+                    } else
+                        sink->AddLine(position);
+                    marks.push_back({position.x, position.y, p, forecast});
+                }
                 sink->EndFigure(D2D1_FIGURE_END_OPEN);
                 sink->Close();
                 lines.push_back({geometry, D2D1::ColorF(forecast ? 0xb6a0ff : 0x72d4e8), forecast});
-                sink.Reset();
-                geometry.Reset();
-            };
-            for (size_t i = 0; i < points.size(); ++i) {
-                const auto &p = points[i];
-                const auto at = timestamp(p["at"]);
-                if (!at || *at < *start || *at >= *end)
-                    continue;
-                const bool valid = !forecast ||
-                    (!early_forecast(*start, *end, *at) && p.contains("projectedUsedPercent") &&
-                     number(p["projectedUsedPercent"]) && p["projectedUsedPercent"].get<double>() >= 0);
-                if (!valid || (sink && *at - previous > 120000))
-                    finish();
-                if (!valid)
-                    continue;
-                const auto used = p[forecast ? "projectedUsedPercent" : "usedPercent"].get<double>();
-                const auto position = D2D1::Point2F(px(p), py(used));
-                if (!sink) {
-                    factory->CreatePathGeometry(geometry.GetAddressOf());
-                    geometry->Open(sink.GetAddressOf());
-                    sink->BeginFigure(position, D2D1_FIGURE_BEGIN_HOLLOW);
-                } else
-                    sink->AddLine(position);
-                previous = *at;
-                marks.push_back({position.x, position.y, i, forecast});
             }
-            finish();
-        }
-        if (last != points.size() && number(projected) && points[last].contains("projectedUsedPercent") &&
-            number(points[last]["projectedUsedPercent"])) {
-            const auto &p = points[last];
-            const double from = p["projectedUsedPercent"].get<double>();
+        if (!points.empty() && number(projected) && points.back().contains("projectedUsedPercent") &&
+            number(points.back()["projectedUsedPercent"])) {
+            const auto &last = points.back();
+            const double from = last.contains("projectedUsedPercent") && number(last["projectedUsedPercent"])
+                                    ? last["projectedUsedPercent"].get<double>()
+                                    : last["usedPercent"].get<double>();
             ComPtr<ID2D1PathGeometry> geometry;
             factory->CreatePathGeometry(geometry.GetAddressOf());
             ComPtr<ID2D1GeometrySink> sink;
             geometry->Open(sink.GetAddressOf());
-            sink->BeginFigure(D2D1::Point2F(px(p), py(from)), D2D1_FIGURE_BEGIN_HOLLOW);
+            sink->BeginFigure(D2D1::Point2F(px(last), py(from)), D2D1_FIGURE_BEGIN_HOLLOW);
             sink->AddLine(D2D1::Point2F(345, py(projected.get<double>())));
             sink->EndFigure(D2D1_FIGURE_END_OPEN);
             sink->Close();
             lines.push_back({geometry, D2D1::ColorF(0xb6a0ff), true});
-            endpoint = {{"at", iso(*end)}, {"projectedUsedPercent", projected}};
-            marks.push_back({345, py(projected.get<double>()), 0, true, true});
+            marks.push_back({345,
+                             py(projected.get<double>()),
+                             {{"at", iso(*end)}, {"projectedUsedPercent", projected}, {"endpoint", true}},
+                             true});
         }
     }
     void paint() {
@@ -525,22 +458,11 @@ struct App {
                      18, 10, 0x9aa7bf);
                 text(reset_time ? "Reset in " + count : count, 86, 31, 209, 25, 17, 0xe9edf7, true);
                 text(projection_text, 86, 58, 212, 20, 11, 0xb6a0ff);
-                if (claude_view["enabled"].get<bool>()) {
-                    line(18, 85, 322, 85, 0x293140);
-                    text(claude_view["stale"].get<bool>() && number(claude_view["usedPercent"])
-                             ? "CLAUDE 5H / LAST SYNCED" : "CLAUDE 5H", 18, 89, 235, 13, 9, 0x9aa7bf);
-                    text(percent(claude_view["usedPercent"]), 18, 101, 68, 21, 14, 0xe4ad83, true);
-                    const auto claude_reset = timestamp(claude_view["resetsAt"]);
-                    text(claude_reset ? "Reset in " + countdown(*claude_reset, now())
-                                     : claude_view["expired"].get<bool>() ? "Window ended" : "Waiting for Claude Code",
-                         86, 103, 236, 18, 11, 0x9aa7bf);
-                }
             } else {
                 text("Codex usage", 19, 16, 240, 24, 17, 0xe9edf7, true);
-                text(claude_view["enabled"].get<bool>() ? claude_line(claude_view, now()) :
-                     view["connection"].get<std::string>() == "online" ? "Account connected"
+                text(view["connection"].get<std::string>() == "online" ? "Account connected"
                                                                        : "Last synced / offline",
-                     20, 39, 240, 17, claude_view["enabled"].get<bool>() ? 9 : 10, 0x9aa7bf);
+                     20, 39, 240, 17, 10, 0x9aa7bf);
                 rounded(16, 65, 348, 167, 0x191f2b);
                 text("CURRENT RESET WINDOW", 30, 78, 270, 18, 10, 0x9aa7bf);
                 text(percent(used), 29, 97, 255, 57, 40, 0xe9edf7, true);
@@ -565,7 +487,7 @@ struct App {
                     target->DrawGeometry(path.geometry.Get(), brush.Get(), path.forecast ? 1.6f : 2.f);
                 }
                 for (const auto &mark : marks)
-                    if (marks.size() < 100 || mark.endpoint) {
+                    if (marks.size() < 100 || mark.point.contains("endpoint")) {
                         brush->SetColor(D2D1::ColorF(mark.forecast ? 0xb6a0ff : 0x72d4e8));
                         target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(mark.x, mark.y), 2.3f, 2.3f),
                                             brush.Get());
@@ -590,8 +512,6 @@ struct App {
                                                                : "Updates every minute";
                 if (view["connectionMessage"].is_string())
                     status = view["connectionMessage"].get<std::string>();
-                else if (claude_view["enabled"].get<bool>())
-                    status = (view["connection"].get<std::string>() == "online" ? "Codex connected | " : "Codex offline | ") + status;
                 text(status, 20, float(expanded_height() - 21), 340, 17, 9, 0x9aa7bf);
             }
             const auto result = target->EndDraw();
@@ -614,17 +534,6 @@ struct App {
         }
     }
     void hover(int x, int y) {
-        if (claude_view["enabled"].get<bool>() &&
-            ((!expanded && y >= 88 && y < 124) || (expanded && y >= 36 && y < 58 && x < 262))) {
-            std::string message = claude_line(claude_view, now());
-            if (const auto reset = timestamp(claude_view["resetsAt"]))
-                message += "\nReset: " + hkt(*reset);
-            if (const auto received = timestamp(claude_view["receivedAt"]))
-                message += "\nLast received: " + hkt(*received);
-            message += "\nUpdates from Claude Code status line";
-            show_tooltip(message, x, y);
-            return;
-        }
         if (!expanded || marks.empty() || y < 270 || y > 390) {
             hide_tooltip();
             return;
@@ -642,7 +551,7 @@ struct App {
             hide_tooltip();
             return;
         }
-        const auto &point = closest->endpoint ? endpoint : view["reset"]["observations"][closest->observation];
+        const auto &point = closest->point;
         std::string message = hkt(*timestamp(point["at"]));
         if (point.contains("usedPercent"))
             message += "\nObserved " + percent(point["usedPercent"], true);
@@ -652,9 +561,6 @@ struct App {
                                                          ? "Unavailable"
                                                          : percent(point["projectedUsedPercent"], true))
                                                   : "Not recorded");
-        show_tooltip(message, x, y);
-    }
-    void show_tooltip(const std::string &message, int x, int y) {
         tooltip_text = wide(message);
         TOOLINFOW tool{sizeof(tool)};
         tool.hwnd = hwnd;
@@ -850,9 +756,6 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w, LPARAM l) {
             if (hit == HTCLIENT) {
                 POINT p{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
                 ScreenToClient(window, &p);
-                if (app->expanded && app->claude_view["enabled"].get<bool>() && p.x < int(262 * app->scale) &&
-                    p.y >= int(36 * app->scale) && p.y < int(58 * app->scale))
-                    return HTCLIENT;
                 if (p.y < int((app->expanded ? 60 : 88) * app->scale))
                     return HTCAPTION;
             }
@@ -914,17 +817,13 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w, LPARAM l) {
             if (w) {
                 app->stopped = true;
                 app->wake.notify_all();
-                app->claude_wake.notify_all();
                 if (app->worker.joinable())
                     app->worker.join();
-                if (app->claude_worker.joinable())
-                    app->claude_worker.join();
             }
             return 0;
         case WM_DESTROY:
             app->stopped = true;
             app->wake.notify_all();
-            app->claude_wake.notify_all();
             PostQuitMessage(0);
             return 0;
         case model_message:
@@ -957,13 +856,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     try {
         const fs::path profile = isolated ? fs::path(environment(L"CODEX_OVERLAY_E2E_USER_DATA"))
                                           : fs::path(environment(L"APPDATA")) / L"codex-token-overlay";
-        int argc{};
-        auto argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-        const bool statusline = argv && argc == 2 && std::wstring(argv[1]) == L"--claude-statusline";
-        if (argv)
-            LocalFree(argv);
-        if (statusline)
-            return claude_statusline(profile);
         fs::create_directories(profile);
         const auto id = wide(sha256(utf8(fs::weakly_canonical(profile).wstring())).substr(0, 16));
         Handle mutex(CreateMutexW(nullptr, TRUE, (L"Local\\CodexTokenOverlayNative-" + id).c_str()));
@@ -997,7 +889,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         if (number(app.state["window"]["x"]) && number(app.state["window"]["y"])) {
             location =
                 restore_position(app.state["window"], {app.expanded ? 380L : 340L,
-                                                       app.expanded ? LONG(app.expanded_height()) : LONG(app.collapsed_height())});
+                                                       app.expanded ? LONG(app.expanded_height()) : 88L});
         } else {
             RECT work{};
             SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
@@ -1006,7 +898,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         HWND window =
             CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_CONTROLPARENT, window_class, app.title.c_str(),
                             WS_POPUP | WS_CLIPCHILDREN, location.x, location.y, app.expanded ? 380 : 340,
-                            app.expanded ? app.expanded_height() : app.collapsed_height(), nullptr, nullptr, instance, &app);
+                            app.expanded ? app.expanded_height() : 88, nullptr, nullptr, instance, &app);
         if (!window)
             throw std::runtime_error("Unable to create overlay window");
         app.login(app.state["settings"]["startAtLogin"]);

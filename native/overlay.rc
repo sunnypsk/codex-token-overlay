@@ -2,8 +2,8 @@
 1 RT_MANIFEST "overlay.manifest"
 101 ICON "../build/icon.ico"
 1 VERSIONINFO
-FILEVERSION 0,2,1,0
-PRODUCTVERSION 0,2,1,0
+FILEVERSION 0,2,0,0
+PRODUCTVERSION 0,2,0,0
 FILEOS VOS_NT_WINDOWS32
 FILETYPE VFT_APP
 BEGIN
@@ -13,11 +13,11 @@ BEGIN
   BEGIN
    VALUE "CompanyName", "Local"
    VALUE "FileDescription", "Codex Token Overlay"
-   VALUE "FileVersion", "0.2.1.0"
+   VALUE "FileVersion", "0.2.0.0"
    VALUE "InternalName", "Codex Token Overlay"
    VALUE "OriginalFilename", "Codex Token Overlay.exe"
    VALUE "ProductName", "Codex Token Overlay"
-   VALUE "ProductVersion", "0.2.1"
+   VALUE "ProductVersion", "0.2.0"
   END
  END
  BLOCK "VarFileInfo"

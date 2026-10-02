@@ -1,13 +1,8 @@
-param([Parameter(Mandatory=$true)][string]$Executable,[ValidateSet('performance','soak')][string]$Mode='performance',[string]$RunLabel=(Get-Date -Format 'yyyyMMdd-HHmmss'),[ValidateRange(20,1440)][int]$SoakMinutes=30,[switch]$Smoke,[switch]$ClaudeUsage,[ValidateRange(15,600)][int]$SampleSeconds=600,[ValidateRange(2,120)][int]$WarmupSeconds=120)
+param([Parameter(Mandatory=$true)][string]$Executable,[ValidateSet('performance','soak')][string]$Mode='performance',[string]$RunLabel=(Get-Date -Format 'yyyyMMdd-HHmmss'),[ValidateRange(20,1440)][int]$SoakMinutes=30,[switch]$Smoke)
 . (Join-Path $PSScriptRoot 'native-test-support.ps1')
 $repo=Split-Path $PSScriptRoot -Parent
 $profile=Join-Path $repo "test-results\native-$Mode-$RunLabel"
 Write-NativeProfile $profile -Fixed:($Mode -eq 'soak')
-if($ClaudeUsage){
-  $received=[DateTimeOffset]::UtcNow
-  $claude=[pscustomobject]@{schemaVersion=1;usedPercent=42;resetsAt=$received.AddHours(5).ToString('yyyy-MM-ddTHH:mm:ss.fffZ');receivedAt=$received.ToString('yyyy-MM-ddTHH:mm:ss.fffZ')}
-  [IO.File]::WriteAllText((Join-Path $profile 'claude-usage.json'),($claude|ConvertTo-Json -Compress),(New-Object Text.UTF8Encoding($false)))
-}
 if($Mode -eq 'soak'){
   $statePath=Join-Path $profile 'quota-state.json'
   $state=Get-Content -LiteralPath $statePath -Raw|ConvertFrom-Json
@@ -27,7 +22,7 @@ try {
     if($phase -eq 'hidden'){Send-OverlayCommand $app.Window 104}
     if($phase -eq 'soak'){Send-OverlayCommand $app.Window 104;Send-OverlayCommand $app.Window 201}
     Write-Output "Warmup: $phase"
-    Start-Sleep -Seconds $(if($Smoke){2}else{$WarmupSeconds})
+    Start-Sleep -Seconds $(if($Smoke){2}else{120})
     $processTree=@(Get-CimInstance Win32_Process)
     $children=@($processTree | Where-Object ParentProcessId -eq $app.Process.Id)
     $childIds=@($children|ForEach-Object{[int]$_.ProcessId})
@@ -38,7 +33,7 @@ try {
     $ids=@($app.Process.Id)+$childIds
     if($Mode -eq 'performance' -and $children.Count -ne 1){throw "Expected one App Server; found $($children.Count)"}
     $elapsed=[Diagnostics.Stopwatch]::StartNew()
-    $duration=if($Smoke){15}elseif($Mode -eq 'performance'){$SampleSeconds}else{60*$SoakMinutes}
+    $duration=if($Smoke){15}elseif($Mode -eq 'performance'){600}else{60*$SoakMinutes}
     $startCpu=0.0
     foreach($id in $ids){$startCpu+=(Get-Process -Id $id).CPU}
     $startGui=[OverlayNativeTest]::GetGuiResources($app.Process.Handle,0)
@@ -60,12 +55,12 @@ try {
       if($delay -gt 0){Start-Sleep -Milliseconds ([int]$delay)}
     }
     $phaseRows=@($rows|Where-Object Phase -eq $phase)
-    $summary=[pscustomobject]@{Phase=$phase;AcceptanceRun=(-not $Smoke -and $SampleSeconds -eq 600 -and $WarmupSeconds -eq 120);ClaudeUsage=$ClaudeUsage.IsPresent;DurationSeconds=$duration;Samples=$phaseRows.Count;PeakPrivateWorkingSetMiB=($phaseRows|Measure-Object PrivateWorkingSetMiB -Maximum).Maximum;AverageCPUPercent=100*$phaseRows[-1].CPUSeconds/$phaseRows[-1].Seconds/[Environment]::ProcessorCount;GDIStart=$startGui;GDIEnd=$phaseRows[-1].GDI;USERStart=$startUser;USEREnd=$phaseRows[-1].USER}
+    $summary=[pscustomobject]@{Phase=$phase;AcceptanceRun=(-not $Smoke);Samples=$phaseRows.Count;PeakPrivateWorkingSetMiB=($phaseRows|Measure-Object PrivateWorkingSetMiB -Maximum).Maximum;AverageCPUPercent=100*$phaseRows[-1].CPUSeconds/$phaseRows[-1].Seconds/[Environment]::ProcessorCount;GDIStart=$startGui;GDIEnd=$phaseRows[-1].GDI;USERStart=$startUser;USEREnd=$phaseRows[-1].USER}
     $summary|ConvertTo-Json|Set-Content (Join-Path $profile "$phase-summary.json")
     $summary|ConvertTo-Json -Compress|Write-Output
     if(-not $Smoke -and $Mode -eq 'performance'){
       $saved=Get-Content (Join-Path $profile 'quota-state.json') -Raw|ConvertFrom-Json
-      if(-not $saved.rateLimitsSyncedAt -or ([DateTimeOffset]::UtcNow-[DateTimeOffset]$saved.rateLimitsSyncedAt).TotalSeconds -gt 90){throw "Quota sync stopped in $phase"}
+      if(-not $saved.rateLimitsSyncedAt -or ([DateTimeOffset]::UtcNow-[DateTimeOffset]::Parse($saved.rateLimitsSyncedAt)).TotalSeconds -gt 90){throw "Quota sync stopped in $phase"}
     }
     if(-not $Smoke -and $summary.PeakPrivateWorkingSetMiB -gt 50){throw "Memory budget exceeded in $phase"}
     if(-not $Smoke -and $Mode -eq 'performance' -and $summary.AverageCPUPercent -gt 0.1){throw "CPU budget exceeded in $phase"}

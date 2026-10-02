@@ -62,7 +62,6 @@ function Start-NativeTest([string]$Executable,[string]$Profile,[switch]$Fixture)
     if ($window -ne [IntPtr]::Zero) { break }
   }
   if ($window -eq [IntPtr]::Zero) { throw 'Native window was not created' }
-  if (-not [OverlayNativeTest]::IsWindowVisible($window)) { Send-OverlayCommand $window 201 }
   return [pscustomobject]@{Process=$process;Window=$window}
 }
 function Write-NativeProfile([string]$Profile,[switch]$Fixed) {

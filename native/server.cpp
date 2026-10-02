@@ -132,7 +132,7 @@ void Server::start(const fs::path &path) {
     auto initialized =
         request("initialize",
                 {{"clientInfo",
-                  {{"name", "codex_token_overlay"}, {"title", "Codex Token Overlay"}, {"version", "0.2.1"}}},
+                  {{"name", "codex_token_overlay"}, {"title", "Codex Token Overlay"}, {"version", "0.2.0"}}},
                  {"capabilities",
                   {{"optOutNotificationMethods",
                     {"thread/started", "item/started", "item/completed", "item/agentMessage/delta"}}}}});

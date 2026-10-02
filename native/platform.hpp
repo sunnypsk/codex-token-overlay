@@ -68,16 +68,6 @@ class Store {
     void save(const Json &state);
 };
 fs::path find_codex();
-class ClaudeReader {
-    fs::path path_;
-    std::string bytes_;
-    Json sample_;
-  public:
-    explicit ClaudeReader(fs::path profile) : path_(std::move(profile) / L"claude-usage.json") {}
-    Json read();
-};
-bool write_claude_sample(const fs::path &profile, const Json &sample);
-int claude_statusline(const fs::path &profile);
 class Server {
     Handle job_, process_, input_, output_, error_;
     std::string buffer_;

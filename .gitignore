@@ -20,5 +20,3 @@ credentials.json
 *.key
 quota-state.json*
 usage-state.json*
-claude-usage.json*
-claude-statusline-setup.json*
